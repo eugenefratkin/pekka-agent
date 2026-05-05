@@ -1,0 +1,16 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "services": {
+    "pekka-agent": {
+      "source": ".",
+      "build": {
+        "builder": "NIXPACKS"
+      },
+      "deploy": {
+        "startCommand": "node mock-server.js",
+        "healthcheckPath": "/",
+        "restartPolicyType": "ON_FAILURE"
+      }
+    }
+  }
+}

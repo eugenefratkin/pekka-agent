@@ -26,6 +26,11 @@ name        = "echo"
 type        = "builtin"
 description = "Returns its input text unchanged; useful for testing"
 
+[[tools]]
+name        = "perplexity_search"
+type        = "builtin"
+description = "Search the internet using Perplexity AI for current information, news, and web knowledge"
+
 # Example HTTP tool (not started by default)
 # [[tools]]
 # name        = "web_search"

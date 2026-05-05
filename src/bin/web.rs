@@ -11,7 +11,7 @@ use pekka_llm::{
     pekka,
     telemetry,
     tools::{
-        builtin::{CalculatorTool, EchoTool},
+        builtin::{CalculatorTool, EchoTool, PerplexitySearchTool},
         http_tool::HttpTool,
         ToolRegistry,
     },
@@ -42,8 +42,12 @@ async fn main() -> anyhow::Result<()> {
     for tool_cfg in &app_config.tools {
         match tool_cfg.tool_type {
             ToolType::Builtin => match tool_cfg.name.as_str() {
-                "calculator" => tools.register(CalculatorTool),
-                "echo"       => tools.register(EchoTool),
+                "calculator"        => tools.register(CalculatorTool),
+                "echo"              => tools.register(EchoTool),
+                "perplexity_search" => match PerplexitySearchTool::from_env() {
+                    Ok(t)  => tools.register(t),
+                    Err(e) => tracing::warn!(error = %e, "perplexity_search disabled"),
+                },
                 n => tracing::warn!(name = n, "unknown builtin — skipping"),
             },
             ToolType::Http => {
@@ -112,5 +116,10 @@ description = "Evaluates arithmetic expressions"
 name        = "echo"
 type        = "builtin"
 description = "Returns its input unchanged"
+
+[[tools]]
+name        = "perplexity_search"
+type        = "builtin"
+description = "Search the internet using Perplexity AI for current information, news, and web knowledge"
 "#).expect("valid default config")
 }
