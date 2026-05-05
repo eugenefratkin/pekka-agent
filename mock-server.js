@@ -36,9 +36,14 @@ const PERPLEXITY_URL    = 'https://api.perplexity.ai/chat/completions';
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     ?? '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? '';
 const BASE_URL             = (process.env.BASE_URL ?? `http://localhost:${PORT}`).replace(/\/$/, '');
-const AUTH_ENABLED         = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+// Auth is active when Google credentials are provided.
+// On a deployed (https) BASE_URL without credentials the server refuses all requests
+// rather than silently opening itself up.
+const AUTH_ENABLED = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+const IS_HTTPS     = BASE_URL.startsWith('https://');
 
-// Emails allowed to log in (lowercase). Empty = allow all authenticated Google accounts.
+// Emails allowed to log in (lowercase).
+// Fail-closed: if the list is empty AND auth is enabled, nobody gets in.
 const WHITELIST = new Set(
   (process.env.WHITELISTED_EMAILS ?? '')
     .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
@@ -82,7 +87,16 @@ function sessionCookieHeader(sid) {
 
 /** Returns the session or redirects to /login and returns null. */
 function requireAuth(req, res) {
-  if (!AUTH_ENABLED) return { email: 'dev' };
+  // Dev bypass: only when running on plain http AND credentials are absent.
+  if (!AUTH_ENABLED && !IS_HTTPS) return { email: 'dev' };
+
+  // On https without credentials → misconfigured; refuse everything.
+  if (!AUTH_ENABLED && IS_HTTPS) {
+    res.writeHead(503, { 'Content-Type': 'text/plain' });
+    res.end('Server misconfigured: GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set.');
+    return null;
+  }
+
   const session = getSession(req);
   if (session) return session;
   res.writeHead(302, { Location: `/login?next=${encodeURIComponent(req.url)}` });
@@ -636,7 +650,9 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && url === '/auth/google') {
     if (!AUTH_ENABLED) { res.writeHead(302, { Location: '/' }); res.end(); return; }
     const state = randHex(16);
-    const next  = query.next ?? '/';
+    // Sanitise: only allow same-origin relative paths (no // proto-relative, no http*)
+    const rawNext = query.next ?? '/';
+    const next    = /^\/[^/]/.test(rawNext) || rawNext === '/' ? rawNext : '/';
     res.writeHead(302, {
       Location:   googleAuthUrl(state),
       'Set-Cookie': [
@@ -653,7 +669,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const cookies  = parseCookies(req);
       const expected = cookies['pekka_state'];
-      const next     = decodeURIComponent(cookies['pekka_next'] ?? '/');
+      const rawNext  = decodeURIComponent(cookies['pekka_next'] ?? '/');
+      const next     = /^\/[^/]/.test(rawNext) || rawNext === '/' ? rawNext : '/';
 
       if (!expected || expected !== query.state) {
         const page = loginPage('Invalid or expired login attempt. Please try again.');
@@ -666,7 +683,8 @@ const server = http.createServer(async (req, res) => {
 
       const email = await exchangeCodeForEmail(query.code);
 
-      if (WHITELIST.size > 0 && !WHITELIST.has(email)) {
+      // Fail-closed: deny if whitelist is empty OR email is not on it.
+      if (!WHITELIST.has(email)) {
         console.log(`[auth] denied: ${email}`);
         res.writeHead(403, { 'Content-Type': 'text/html' }); res.end(deniedPage(email)); return;
       }
