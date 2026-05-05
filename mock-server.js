@@ -230,13 +230,14 @@ function jitter(base, spread = 0.3) {
  * Returns { content, citations } on success, or throws on error.
  * Falls back to null if no API key is set (caller uses mock response).
  */
-async function callPerplexity(query, systemPrompt = 'Be precise and concise.') {
+async function callPerplexity(query, systemPrompt = 'Be precise and concise.', history = []) {
   if (!PERPLEXITY_KEY) return null;
 
   const body = JSON.stringify({
     model: PERPLEXITY_MODEL,
     messages: [
       { role: 'system', content: systemPrompt },
+      ...history,
       { role: 'user',   content: query },
     ],
   });
@@ -560,7 +561,9 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
 
 async function streamScenario(res, message, sessionId, model) {
   const hist = getHistory(sessionId);
-  const histContext = hist.length
+  // histMessages is the canonical form — used in every LLM call this turn
+  const histMessages = hist.map(h => ({ role: h.role, content: h.content }));
+  const histContext  = hist.length
     ? 'Prior conversation:\n' + hist.map(h => `${h.role}: ${h.content}`).join('\n') + '\n\n'
     : '';
   const baseSystem = histContext
@@ -584,7 +587,7 @@ async function streamScenario(res, message, sessionId, model) {
   const tDiscover = Date.now();
   let discoveryResult = null;
   try {
-    const pplx = await callPerplexity(message, baseSystem);
+    const pplx = await callPerplexity(message, baseSystem, histMessages);
     if (pplx) {
       discoveryResult = pplx.citations?.length
         ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
@@ -618,11 +621,12 @@ async function streamScenario(res, message, sessionId, model) {
   try {
     const planContent = await callOpenAI([
       { role: 'system', content:
-          'You are a research planner. Given an original question and discovery results, ' +
-          'identify specific entities (companies, people, topics, products) that each need ' +
-          'individual deeper research. Output ONLY a JSON array of focused search query ' +
-          'strings (2-5 items). If the discovery already fully answers the question output []. ' +
+          'You are a research planner. Given prior conversation, an original question, and ' +
+          'discovery results, identify specific entities (companies, people, topics, products) ' +
+          'that each need individual deeper research. Output ONLY a JSON array of focused search ' +
+          'query strings (2-5 items). If discovery already fully answers the question output []. ' +
           'No explanation, no markdown fences — just the array.' },
+      ...histMessages,
       { role: 'user', content:
           `Original question: "${message}"\n\nDiscovery results:\n${discoveryResult.slice(0, 3000)}` },
     ]);
@@ -664,9 +668,16 @@ async function streamScenario(res, message, sessionId, model) {
     if (i < followUpQueries.length - 1) await sleep(15);
   }
 
+  // System prompt for deep-dive calls: includes original question + discovery summary
+  const deepSystem =
+    `You are a focused research assistant. The user asked: "${message}". ` +
+    `Key context already found:\n${discoveryResult.slice(0, 800)}\n\n` +
+    `Answer the specific sub-query concisely and precisely. ` +
+    (histContext ? `\nPrior conversation context:\n${histContext}` : '');
+
   const tDeep = Date.now();
   const rawDeep = await Promise.all(
-    followUpQueries.map(q => callPerplexity(q, 'Be precise and concise.').catch(e => {
+    followUpQueries.map(q => callPerplexity(q, deepSystem, histMessages).catch(e => {
       console.error('[deep]', e.message); return null;
     }))
   );
@@ -708,10 +719,11 @@ async function streamScenario(res, message, sessionId, model) {
   try {
     finalAnswer = await callOpenAI([
       { role: 'system', content:
-          (histContext || '') +
           'You are a helpful research assistant. Synthesise the provided research results into ' +
           'one clear, well-structured answer. Use markdown. Integrate information naturally — ' +
-          'do not say "according to source 1/2/3" or reference section names explicitly.' },
+          'do not say "according to source 1/2/3" or reference section names explicitly. ' +
+          'Be aware of prior conversation context when shaping the response.' },
+      ...histMessages,
       { role: 'user', content:
           `Question: "${message}"\n\n## Discovery\n${discoveryResult}\n\n` +
           followUpQueries.map((q, i) => `## Deep-dive: ${q}\n${deepResults[i]}`).join('\n\n') +
