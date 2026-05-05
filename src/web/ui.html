@@ -215,6 +215,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
     <div class="pill" id="sseStatus">● disconnected</div>
     <div class="pill" id="sessionPill">no session</div>
     <button class="btn" id="btnNew">+ New session</button>
+    <div class="pill" id="userPill" style="display:none"></div>
+    <a href="/logout" class="btn" id="btnLogout" style="display:none">Sign out</a>
   </div>
 </div>
 
@@ -677,6 +679,17 @@ document.getElementById('btnClear').addEventListener('click', () => {
 // Boot
 // ═══════════════════════════════════════════════════════════════
 (async () => {
+  // Show logged-in user if auth is enabled
+  try {
+    const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
+    if (me?.email) {
+      const pill = document.getElementById('userPill');
+      pill.textContent = me.email;
+      pill.style.display = '';
+      document.getElementById('btnLogout').style.display = '';
+    }
+  } catch {}
+
   connectSpanSSE();
   await createSession().catch(e =>
     addMsg('err', 'Could not create session: ' + e.message));

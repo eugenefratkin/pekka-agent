@@ -31,6 +31,170 @@ const PERPLEXITY_KEY    = process.env.PERPLEXITY_API_KEY ?? '';
 const PERPLEXITY_MODEL  = 'sonar';
 const PERPLEXITY_URL    = 'https://api.perplexity.ai/chat/completions';
 
+// ─── Auth config ──────────────────────────────────────────────────────────────
+
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     ?? '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? '';
+const BASE_URL             = (process.env.BASE_URL ?? `http://localhost:${PORT}`).replace(/\/$/, '');
+const AUTH_ENABLED         = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+
+// Emails allowed to log in (lowercase). Empty = allow all authenticated Google accounts.
+const WHITELIST = new Set(
+  (process.env.WHITELISTED_EMAILS ?? '')
+    .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+);
+
+// ─── Session store ────────────────────────────────────────────────────────────
+
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const sessionStore   = new Map(); // sid → { email, expires }
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    try { out[k] = decodeURIComponent(v); } catch { out[k] = v; }
+  }
+  return out;
+}
+
+function getSession(req) {
+  const sid = parseCookies(req)['pekka_sid'];
+  if (!sid) return null;
+  const s = sessionStore.get(sid);
+  if (!s || s.expires < Date.now()) { sessionStore.delete(sid); return null; }
+  return s;
+}
+
+function createSession(email) {
+  const sid = randHex(32);
+  sessionStore.set(sid, { email, expires: Date.now() + SESSION_TTL_MS });
+  return sid;
+}
+
+function sessionCookieHeader(sid) {
+  const secure = BASE_URL.startsWith('https') ? '; Secure' : '';
+  return `pekka_sid=${sid}; HttpOnly; SameSite=Lax; Path=/${secure}; Max-Age=${SESSION_TTL_MS / 1000}`;
+}
+
+/** Returns the session or redirects to /login and returns null. */
+function requireAuth(req, res) {
+  if (!AUTH_ENABLED) return { email: 'dev' };
+  const session = getSession(req);
+  if (session) return session;
+  res.writeHead(302, { Location: `/login?next=${encodeURIComponent(req.url)}` });
+  res.end();
+  return null;
+}
+
+// ─── Google OAuth helpers ─────────────────────────────────────────────────────
+
+function googleAuthUrl(state) {
+  return 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id:     GOOGLE_CLIENT_ID,
+    redirect_uri:  `${BASE_URL}/auth/callback`,
+    response_type: 'code',
+    scope:         'openid email profile',
+    state,
+    prompt:        'select_account',
+  });
+}
+
+async function exchangeCodeForEmail(code) {
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    new URLSearchParams({
+      code,
+      client_id:     GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri:  `${BASE_URL}/auth/callback`,
+      grant_type:    'authorization_code',
+    }).toString(),
+  });
+  if (!tokenRes.ok) throw new Error(`token exchange failed: ${tokenRes.status}`);
+  const { id_token } = await tokenRes.json();
+
+  const infoRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${id_token}`);
+  if (!infoRes.ok) throw new Error(`tokeninfo failed: ${infoRes.status}`);
+  const info = await infoRes.json();
+  if (!info.email_verified) throw new Error('Google email not verified');
+  return info.email.toLowerCase();
+}
+
+// ─── Auth pages ───────────────────────────────────────────────────────────────
+
+function loginPage(error = '') {
+  const errHtml = error
+    ? `<p style="margin-top:16px;color:#f85149;font-size:12px">${esc(error)}</p>`
+    : '';
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pekka-llm — Sign in</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;min-height:100vh;display:flex;
+     align-items:center;justify-content:center;
+     font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;
+      padding:40px;text-align:center;width:340px}
+.logo{font-size:20px;font-weight:700;margin-bottom:6px}
+.logo span{color:#7c3aed}
+.sub{color:#7d8590;font-size:13px;margin-bottom:28px}
+.google-btn{display:flex;align-items:center;justify-content:center;gap:10px;
+  background:#fff;color:#1f1f1f;border:none;border-radius:6px;
+  padding:11px 20px;font-size:14px;font-weight:500;cursor:pointer;
+  text-decoration:none;width:100%;transition:opacity .15s}
+.google-btn:hover{opacity:.9}
+</style></head><body>
+<div class="card">
+  <div class="logo">◆ <span>pekka</span>-llm</div>
+  <p class="sub">Sign in to continue</p>
+  <a href="/auth/google" class="google-btn">
+    <svg width="18" height="18" viewBox="0 0 24 24">
+      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+    </svg>
+    Sign in with Google
+  </a>
+  ${errHtml}
+</div></body></html>`;
+}
+
+function deniedPage(email) {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>pekka-llm — Access denied</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;min-height:100vh;display:flex;
+     align-items:center;justify-content:center;
+     font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;
+      padding:40px;text-align:center;width:380px}
+.logo{font-size:20px;font-weight:700;margin-bottom:6px}
+.logo span{color:#7c3aed}
+h2{margin:20px 0 8px;font-size:16px}
+p{color:#7d8590;font-size:13px;margin-bottom:24px}
+.email{font-family:monospace;background:#21262d;padding:2px 8px;border-radius:4px;font-size:12px}
+a{color:#58a6ff;font-size:13px}
+</style></head><body>
+<div class="card">
+  <div class="logo">◆ <span>pekka</span>-llm</div>
+  <h2>Access denied</h2>
+  <p><span class="email">${esc(email)}</span> is not on the allow-list.</p>
+  <a href="/logout">Sign in with a different account</a>
+</div></body></html>`;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 const sleep   = ms  => new Promise(r => setTimeout(r, ms));
@@ -453,7 +617,100 @@ function json(res, status, body) {
 const MODEL = 'gpt-4o-mini (mock)';
 
 const server = http.createServer(async (req, res) => {
-  const { method, url } = req;
+  const { method } = req;
+  // Strip query string for routing
+  const url      = req.url.split('?')[0];
+  const fullUrl  = req.url;
+  const query    = Object.fromEntries(new URLSearchParams(req.url.includes('?') ? req.url.split('?')[1] : ''));
+
+  // ── GET /login ──────────────────────────────────────────────────────────────
+  if (method === 'GET' && url === '/login') {
+    if (!AUTH_ENABLED) { res.writeHead(302, { Location: '/' }); res.end(); return; }
+    const page = loginPage();
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(page);
+    return;
+  }
+
+  // ── GET /auth/google → redirect to Google consent ──────────────────────────
+  if (method === 'GET' && url === '/auth/google') {
+    if (!AUTH_ENABLED) { res.writeHead(302, { Location: '/' }); res.end(); return; }
+    const state = randHex(16);
+    const next  = query.next ?? '/';
+    res.writeHead(302, {
+      Location:   googleAuthUrl(state),
+      'Set-Cookie': [
+        `pekka_state=${state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
+        `pekka_next=${encodeURIComponent(next)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
+      ],
+    });
+    res.end();
+    return;
+  }
+
+  // ── GET /auth/callback → exchange code, verify email, set session ───────────
+  if (method === 'GET' && url === '/auth/callback') {
+    try {
+      const cookies  = parseCookies(req);
+      const expected = cookies['pekka_state'];
+      const next     = decodeURIComponent(cookies['pekka_next'] ?? '/');
+
+      if (!expected || expected !== query.state) {
+        const page = loginPage('Invalid or expired login attempt. Please try again.');
+        res.writeHead(400, { 'Content-Type': 'text/html' }); res.end(page); return;
+      }
+      if (query.error) {
+        const page = loginPage(`Google error: ${query.error}`);
+        res.writeHead(400, { 'Content-Type': 'text/html' }); res.end(page); return;
+      }
+
+      const email = await exchangeCodeForEmail(query.code);
+
+      if (WHITELIST.size > 0 && !WHITELIST.has(email)) {
+        console.log(`[auth] denied: ${email}`);
+        res.writeHead(403, { 'Content-Type': 'text/html' }); res.end(deniedPage(email)); return;
+      }
+
+      const sid = createSession(email);
+      console.log(`[auth] login: ${email}`);
+      res.writeHead(302, {
+        Location:   next,
+        'Set-Cookie': [
+          sessionCookieHeader(sid),
+          'pekka_state=; HttpOnly; Path=/; Max-Age=0',
+          'pekka_next=;  HttpOnly; Path=/; Max-Age=0',
+        ],
+      });
+      res.end();
+    } catch (e) {
+      console.error('[auth] callback error:', e.message);
+      const page = loginPage('Sign-in failed. Please try again.');
+      res.writeHead(500, { 'Content-Type': 'text/html' }); res.end(page);
+    }
+    return;
+  }
+
+  // ── GET /logout ─────────────────────────────────────────────────────────────
+  if (method === 'GET' && url === '/logout') {
+    const sid = parseCookies(req)['pekka_sid'];
+    if (sid) sessionStore.delete(sid);
+    res.writeHead(302, {
+      Location:   '/login',
+      'Set-Cookie': 'pekka_sid=; HttpOnly; Path=/; Max-Age=0',
+    });
+    res.end();
+    return;
+  }
+
+  // ── Auth gate — all routes below require a valid session ────────────────────
+  const session = requireAuth(req, res);
+  if (!session) return;
+
+  // ── GET /api/me ─────────────────────────────────────────────────────────────
+  if (method === 'GET' && url === '/api/me') {
+    json(res, 200, { email: session.email });
+    return;
+  }
 
   // ── GET / → serve ui.html ───────────────────────────────────────────────────
   if (method === 'GET' && (url === '/' || url === '/index.html')) {
@@ -470,13 +727,13 @@ const server = http.createServer(async (req, res) => {
   // ── POST /api/session ───────────────────────────────────────────────────────
   if (method === 'POST' && url === '/api/session') {
     const session_id = crypto.randomUUID();
-    console.log(`[session] created ${session_id}`);
+    console.log(`[session] created ${session_id} (user: ${session.email})`);
     json(res, 200, { session_id });
     return;
   }
 
   // ── POST /api/session/:id/stream ────────────────────────────────────────────
-  const streamMatch = url.match(/^\/api\/session\/([^/]+)\/stream$/);
+  const streamMatch = fullUrl.match(/^\/api\/session\/([^/?]+)\/stream/);
   if (method === 'POST' && streamMatch) {
     const sessionId = streamMatch[1];
     let body;
@@ -497,7 +754,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── POST /api/session/:id/chat (non-streaming) ──────────────────────────────
-  const chatMatch = url.match(/^\/api\/session\/([^/]+)\/chat$/);
+  const chatMatch = fullUrl.match(/^\/api\/session\/([^/?]+)\/chat/);
   if (method === 'POST' && chatMatch) {
     let body;
     try { body = await parseBody(req); }
@@ -507,7 +764,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── DELETE /api/session/:id/cancel ──────────────────────────────────────────
-  const cancelMatch = url.match(/^\/api\/session\/([^/]+)\/cancel$/);
+  const cancelMatch = fullUrl.match(/^\/api\/session\/([^/?]+)\/cancel/);
   if (method === 'DELETE' && cancelMatch) {
     res.writeHead(204); res.end();
     return;
@@ -516,10 +773,8 @@ const server = http.createServer(async (req, res) => {
   // ── GET /events/spans (SSE) ─────────────────────────────────────────────────
   if (method === 'GET' && url === '/events/spans') {
     sseHeaders(res);
-    // Send a keepalive comment immediately
     res.write(': connected\n\n');
     addSpanClient(res);
-    // Keep the connection alive with periodic comments
     const keepalive = setInterval(() => {
       try { res.write(': ping\n\n'); } catch { clearInterval(keepalive); }
     }, 15_000);
