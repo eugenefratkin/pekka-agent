@@ -232,6 +232,38 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ── Mobile ─────────────────────────────────────────────── */
+@media (max-width: 700px) {
+  /* Allow topbar to wrap onto 2 rows */
+  .app{grid-template-rows:auto 1fr}
+  .topbar{flex-wrap:wrap;padding:8px 12px;gap:6px;height:auto}
+  .topbar-tabs{order:-1;width:100%;margin-left:0;justify-content:flex-start}
+  .topbar-right{margin-left:0;gap:6px;flex-wrap:wrap}
+  /* Hide lower-priority topbar items */
+  #sseStatus,#sessionPill,#userPill{display:none!important}
+  /* Compact provider selects */
+  #providerSelect,#modelSelect{max-width:110px;font-size:11px;padding:4px 6px}
+
+  /* Stack panels: show only the active one */
+  .main{grid-template-columns:1fr}
+  .trace-panel{display:none}
+  .panel{border-right:none}
+
+  /* Span row: narrower name column */
+  .span-row{grid-template-columns:100px 1fr 40px;
+    padding:4px 8px 4px calc(8px + var(--depth,0)*12px)}
+  .attr-table td:first-child{width:36%}
+
+  /* Prevent iOS auto-zoom on input focus */
+  .input-bar input{font-size:16px}
+
+  /* Messages take full width */
+  .msg{max-width:96%}
+
+  /* Loop panel taller on mobile */
+  .loop-panel.open{max-height:220px}
+}
 </style>
 </head>
 <body>
@@ -332,7 +364,10 @@ function switchTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => {
     t.classList.toggle('active', (i===0) === (name==='agent'));
   });
-  // On mobile we'd hide panels; on desktop both are always visible
+  if (window.innerWidth <= 700) {
+    document.getElementById('agentPanel').style.display  = name === 'agent'  ? '' : 'none';
+    document.getElementById('tracesPanel').style.display = name === 'traces' ? '' : 'none';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -819,6 +854,13 @@ async function selectProvider(provider, model) {
 
   connectSpanSSE();
   loadProviders();
+  // Restore both panels when resizing to desktop
+  window.addEventListener('resize', () => {
+    if (window.innerWidth > 700) {
+      document.getElementById('agentPanel').style.display  = '';
+      document.getElementById('tracesPanel').style.display = '';
+    }
+  });
   await createSession().catch(e =>
     addMsg('err', 'Could not create session: ' + e.message));
   document.getElementById('msgInput').focus();
