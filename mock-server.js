@@ -401,16 +401,37 @@ function makeSpan(name, tid, sid, parentSid, startMs, durationMs, attrs = {}) {
 
 /**
  * Emit a realistic OTel trace for one request after the agent loop finishes.
- * Broadcasts each span individually so the waterfall builds up incrementally.
+ *
+ * Durations are computed bottom-up from actual tool call timings so that the
+ * react.session bar always covers all its children and react.observe never
+ * appears as a stray dot at the far right.
  */
 async function emitTrace(sessionId, model, iterations, toolCalls, message = '', reasonings = []) {
   const tid   = traceId();
   const now   = Date.now();
   const spans = [];
 
-  // ── react.session (root) ──────────────────────────────────────────────────
+  // ── Pre-compute per-iteration wall time from actual tool durations ─────────
+  const THINK_MS = 600;  // fixed estimate for think spans
+  const OBS_MS   = 80;
+
+  const iterDurations = [];
+  for (let i = 0; i < iterations; i++) {
+    const tools = i < toolCalls.length ? toolCalls[i] : [];
+    let iterMs = THINK_MS + 15;
+    if (tools.length) {
+      const isParallel = tools.some(t => t.parallel);
+      const actMs = isParallel
+        ? Math.max(...tools.map(t => t.durationMs)) + 20
+        : tools.reduce((s, t) => s + t.durationMs, 0) + 20;
+      iterMs += actMs + OBS_MS + 20;
+    }
+    iterDurations.push(iterMs);
+  }
+  const totalMs = iterDurations.reduce((s, d) => s + d, 0) + 40;
+
+  // ── react.session (root) — duration derived from children ─────────────────
   const sessionSid = spanId();
-  const totalMs    = iterations * jitter(1800, 0.4);
   spans.push(makeSpan('react.session', tid, sessionSid, null, now, totalMs, {
     'react.session_id':     sessionId,
     'gen_ai.system':        'openai',
@@ -421,77 +442,76 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
   let offset = 20;
 
   for (let i = 0; i < iterations; i++) {
-    const iterSid = spanId();
-    const iterMs  = Math.round(totalMs / iterations);
+    const iterMs    = iterDurations[i];
+    const iterSid   = spanId();
     const iterStart = now + offset;
-    spans.push(makeSpan('react.iteration', tid, iterSid, sessionSid, iterStart, iterMs - 10, {
+
+    spans.push(makeSpan('react.iteration', tid, iterSid, sessionSid, iterStart, iterMs, {
       'react.session_id': sessionId,
       'react.iteration':  i,
     }));
 
     // react.think
     const thinkSid   = spanId();
-    const thinkMs    = jitter(900, 0.35);
     const thinkStart = iterStart + 5;
     const thinkAttrs = {
-      'gen_ai.operation.name':  'chat',
-      'gen_ai.request.model':   model,
-      'react.iteration':        i,
+      'gen_ai.operation.name': 'chat',
+      'gen_ai.request.model':  model,
+      'react.iteration':       i,
     };
-    if (i === 0 && message)           thinkAttrs['gen_ai.input']     = message;
-    if (reasonings[i] != null)        thinkAttrs['react.reasoning']  = reasonings[i];
-    spans.push(makeSpan('react.think', tid, thinkSid, iterSid, thinkStart, thinkMs, thinkAttrs));
+    if (i === 0 && message)    thinkAttrs['gen_ai.input']    = message;
+    if (reasonings[i] != null) thinkAttrs['react.reasoning'] = reasonings[i];
+    spans.push(makeSpan('react.think', tid, thinkSid, iterSid, thinkStart, THINK_MS, thinkAttrs));
 
-    let actOffset = thinkMs + 10;
+    let cursor = THINK_MS + 10; // cursor = offset from iterStart
 
-    // react.act + tool.call spans (only iterations with tools)
+    // react.act + tool.call + react.observe
     const iterTools = i < toolCalls.length ? toolCalls[i] : [];
     if (iterTools.length) {
-      const actSid   = spanId();
-      const isParallelAct0 = iterTools.some(t => t.parallel);
-      const actMs    = isParallelAct0
+      const isParallel = iterTools.some(t => t.parallel);
+      const actMs   = isParallel
         ? Math.max(...iterTools.map(t => t.durationMs)) + 20
         : iterTools.reduce((s, t) => s + t.durationMs, 0) + 20;
-      const actStart = iterStart + actOffset;
+      const actSid   = spanId();
+      const actStart = iterStart + cursor;
+
       spans.push(makeSpan('react.act', tid, actSid, iterSid, actStart, actMs, {
         'react.iteration':       i,
         'react.tool_call_count': iterTools.length,
       }));
 
-      if (isParallelAct0) {
-        // All tools start nearly simultaneously — shows parallelism in waterfall
+      if (isParallel) {
         for (const tc of iterTools) {
-          const toolSid   = spanId();
-          const toolStart = actStart + 5 + (tc.startOffset || 0);
-          spans.push(makeSpan('tool.call', tid, toolSid, actSid, toolStart, tc.durationMs, {
-            'tool.name':    tc.name,
-            'tool.call_id': tc.callId,
-            'tool.success': true,
-          }));
+          const toolSid = spanId();
+          spans.push(makeSpan('tool.call', tid, toolSid, actSid,
+            actStart + 5 + (tc.startOffset || 0), tc.durationMs, {
+              'tool.name':    tc.name,
+              'tool.call_id': tc.callId,
+              'tool.success': true,
+            }));
         }
       } else {
-        let toolOffset = 5;
+        let toolOff = 5;
         for (const tc of iterTools) {
-          const toolSid   = spanId();
-          const toolStart = actStart + toolOffset;
-          spans.push(makeSpan('tool.call', tid, toolSid, actSid, toolStart, tc.durationMs, {
-            'tool.name':    tc.name,
-            'tool.call_id': tc.callId,
-            'tool.success': true,
-          }));
-          toolOffset += tc.durationMs + 5;
+          const toolSid = spanId();
+          spans.push(makeSpan('tool.call', tid, toolSid, actSid,
+            actStart + toolOff, tc.durationMs, {
+              'tool.name':    tc.name,
+              'tool.call_id': tc.callId,
+              'tool.success': true,
+            }));
+          toolOff += tc.durationMs + 5;
         }
       }
 
-      actOffset += actMs + 10;
+      cursor += actMs + 5;
 
-      // react.observe
-      const obsSid   = spanId();
-      const obsMs    = jitter(80, 0.4);
-      spans.push(makeSpan('react.observe', tid, obsSid, iterSid, iterStart + actOffset, obsMs, {
-        'react.iteration':  i,
-        'react.num_results': iterTools.length,
-      }));
+      // react.observe — placed immediately after act completes
+      spans.push(makeSpan('react.observe', tid, spanId(), iterSid,
+        iterStart + cursor, OBS_MS, {
+          'react.iteration':   i,
+          'react.num_results': iterTools.length,
+        }));
     }
 
     offset += iterMs;
@@ -504,52 +524,89 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
   }
 }
 
-// ─── Parallel research scenario ───────────────────────────────────────────────
+// ─── ReAct loop: Plan → Parallel Research → Synthesize ───────────────────────
 
 async function streamScenario(res, message, sessionId, model) {
-  const subQueries = decomposeQuery(message);
-  const reasoning  = subQueries.length > 1
-    ? `I'll research this with ${subQueries.length} parallel searches simultaneously`
-    : `I'll use Perplexity to research: "${message}"`;
-
-  // Build context from conversation history
   const hist = getHistory(sessionId);
   const histContext = hist.length
-    ? 'Prior conversation context:\n' + hist.map(h => `${h.role}: ${h.content}`).join('\n') + '\n\n'
+    ? 'Prior conversation:\n' + hist.map(h => `${h.role}: ${h.content}`).join('\n') + '\n\n'
     : '';
-  const systemPrompt = histContext
-    ? `${histContext}Be precise and concise. Use the prior context above to give coherent follow-up answers.`
-    : 'Be precise and concise.';
 
-  // ── Iteration 0: think → parallel searches ───────────────────────────────
+  // ══ Iteration 0: Plan ═════════════════════════════════════════════════════
   agentEvent(res, { type: 'iteration_start', iteration: 0 });
   await sleep(jitter(100));
   agentEvent(res, { type: 'think_start', iteration: 0 });
-  await sleep(jitter(400, 0.2));
-  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
+  await sleep(jitter(350, 0.2));
+  const planReasoning = `I need to plan how to research: "${message.slice(0, 80)}"`;
+  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: planReasoning });
   await sleep(80);
 
-  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: subQueries.length });
+  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
+  const planCallId = randHex(4);
+  agentEvent(res, { type: 'tool_call_start', call_id: planCallId,
+    name: 'plan_research', args: { question: message.slice(0, 140) } });
+
+  // Ask the LLM to decide the decomposition
+  let subQueries = null;
+  if (PERPLEXITY_KEY) {
+    try {
+      const planSystem =
+        `You are a research planner. Given a question, output a JSON array of 2-4 focused ` +
+        `search queries that together will comprehensively answer it. Each query must cover a ` +
+        `distinct aspect with no overlap. ` +
+        (histContext ? `Prior conversation for context:\n${histContext}\n` : '') +
+        `Output ONLY a valid JSON array of strings — no explanation, no markdown fences.`;
+      const planRes = await callPerplexity(message, planSystem);
+      if (planRes?.content) {
+        const match = planRes.content.match(/\[[\s\S]*?\]/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed) && parsed.length >= 2) {
+            subQueries = parsed.slice(0, 4).map(String);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[plan]', e.message);
+    }
+  }
+  if (!subQueries) subQueries = decomposeQuery(message);
+
+  const planSummary = `Research plan (${subQueries.length} parallel searches):\n` +
+    subQueries.map((q, i) => `${i + 1}. ${q}`).join('\n');
+  agentEvent(res, { type: 'tool_call_done', call_id: planCallId,
+    name: 'plan_research', result: planSummary, success: true });
+  await sleep(60);
+  agentEvent(res, { type: 'observe_done', iteration: 0 });
+  await sleep(100);
+
+  // ══ Iteration 1: Parallel research ════════════════════════════════════════
+  agentEvent(res, { type: 'iteration_start', iteration: 1 });
+  await sleep(jitter(80));
+  agentEvent(res, { type: 'think_start', iteration: 1 });
+  await sleep(jitter(300, 0.2));
+  const researchReasoning = `Executing ${subQueries.length} parallel searches`;
+  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: researchReasoning });
+  await sleep(80);
+
+  agentEvent(res, { type: 'act_start', iteration: 1, num_tools: subQueries.length });
   await sleep(40);
 
   const callIds = subQueries.map(() => randHex(4));
-  // Emit all tool_call_start events nearly simultaneously
   for (let i = 0; i < subQueries.length; i++) {
     agentEvent(res, { type: 'tool_call_start', call_id: callIds[i],
       name: 'perplexity_search', args: { query: subQueries[i] } });
     if (i < subQueries.length - 1) await sleep(15);
   }
 
-  // ── Run all searches in parallel ─────────────────────────────────────────
   const t0 = Date.now();
   const rawResults = await Promise.all(
-    subQueries.map(q => callPerplexity(q, systemPrompt).catch(e => {
+    subQueries.map(q => callPerplexity(q, 'Be precise and concise.').catch(e => {
       console.error('[perplexity]', e.message); return null;
     }))
   );
   const parallelDuration = Date.now() - t0;
 
-  // Emit tool_call_done for each with small stagger (they all finished, show in order)
   const toolResults = [];
   for (let i = 0; i < subQueries.length; i++) {
     const pplx = rawResults[i];
@@ -557,7 +614,7 @@ async function streamScenario(res, message, sessionId, model) {
       ? (pplx.citations?.length
           ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
           : pplx.content)
-      : `(Perplexity unavailable) No answer for: "${subQueries[i]}"`;
+      : `No result for: "${subQueries[i]}"`;
     agentEvent(res, { type: 'tool_call_done', call_id: callIds[i],
       name: 'perplexity_search', result, success: !!pplx });
     toolResults.push(result);
@@ -565,29 +622,60 @@ async function streamScenario(res, message, sessionId, model) {
   }
 
   await sleep(60);
-  agentEvent(res, { type: 'observe_done', iteration: 0 });
+  agentEvent(res, { type: 'observe_done', iteration: 1 });
   await sleep(100);
 
-  // ── Iteration 1: synthesise ───────────────────────────────────────────────
-  agentEvent(res, { type: 'iteration_start', iteration: 1 });
+  // ══ Iteration 2: Synthesize ════════════════════════════════════════════════
+  agentEvent(res, { type: 'iteration_start', iteration: 2 });
   await sleep(jitter(80));
-  agentEvent(res, { type: 'think_start', iteration: 1 });
-  await sleep(jitter(400, 0.3));
-  const synthNote = subQueries.length > 1 ? 'Synthesising results from parallel searches…' : null;
-  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: synthNote });
-  await sleep(50);
+  agentEvent(res, { type: 'think_start', iteration: 2 });
+  await sleep(jitter(350, 0.2));
+  agentEvent(res, { type: 'think_done', iteration: 2,
+    partial_text: 'Synthesising results from parallel searches into one answer…' });
+  await sleep(80);
 
-  const finalAnswer = subQueries.length > 1
-    ? toolResults.map((r, i) => `### ${subQueries[i].split(' — ')[1] ?? subQueries[i]}\n\n${r}`).join('\n\n---\n\n')
-    : toolResults[0];
+  agentEvent(res, { type: 'act_start', iteration: 2, num_tools: 1 });
+  const synthCallId = randHex(4);
+  agentEvent(res, { type: 'tool_call_start', call_id: synthCallId,
+    name: 'synthesize', args: { sources: subQueries.length } });
 
-  agentEvent(res, { type: 'final_answer', content: finalAnswer, iterations: 2 });
+  let finalAnswer = null;
+  if (PERPLEXITY_KEY) {
+    try {
+      const synthUser =
+        `Question: "${message}"\n\n` +
+        subQueries.map((q, i) => `### Research ${i + 1}: ${q}\n${toolResults[i]}`).join('\n\n') +
+        `\n\nWrite a single, well-structured answer that synthesises all research above. ` +
+        `Be comprehensive yet concise. Use markdown. Do not repeat section headings from the research verbatim.`;
+      const synthSystem =
+        (histContext ? histContext : '') +
+        `You are a helpful research assistant. Synthesise multiple research results into one clear, ` +
+        `coherent answer. Do not say "according to research 1/2/3" — just integrate the information naturally.`;
+      const synthRes = await callPerplexity(synthUser, synthSystem);
+      finalAnswer = synthRes?.content ?? null;
+    } catch (e) {
+      console.error('[synthesize]', e.message);
+    }
+  }
+  // Fallback: labelled sections
+  if (!finalAnswer) {
+    finalAnswer = toolResults
+      .map((r, i) => `### ${subQueries[i]}\n\n${r}`)
+      .join('\n\n---\n\n');
+  }
 
-  // Persist to history
+  agentEvent(res, { type: 'tool_call_done', call_id: synthCallId,
+    name: 'synthesize', result: finalAnswer.slice(0, 200) + '…', success: true });
+  await sleep(60);
+  agentEvent(res, { type: 'observe_done', iteration: 2 });
+  await sleep(80);
+
+  agentEvent(res, { type: 'final_answer', content: finalAnswer, iterations: 3 });
+
   appendHistory(sessionId, 'user', message);
   appendHistory(sessionId, 'assistant', finalAnswer.slice(0, 800));
 
-  // Parallel tool spans for the OTel waterfall
+  // OTel: iteration 1 tools are parallel, plan + synth are sequential single calls
   const toolSpans = subQueries.map((_, i) => ({
     name: 'perplexity_search',
     callId: callIds[i],
@@ -596,7 +684,15 @@ async function streamScenario(res, message, sessionId, model) {
     startOffset: i * 15,
   }));
 
-  emitTrace(sessionId, model, 2, [toolSpans, []], message, [reasoning, synthNote]);
+  emitTrace(sessionId, model, 3, [
+    [{ name: 'plan_research',      callId: planCallId,  durationMs: jitter(350) }],
+    toolSpans,
+    [{ name: 'synthesize',         callId: synthCallId, durationMs: jitter(400) }],
+  ], message, [
+    planReasoning,
+    researchReasoning,
+    'Synthesising results from parallel searches into one answer…',
+  ]);
   res.end();
 }
 
