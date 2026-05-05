@@ -25,7 +25,7 @@ try {
   });
 } catch { /* .env not required */ }
 
-const PORT              = parseInt(process.env.PORT ?? '3000', 10);
+const PORT              = parseInt(process.env.PORT ?? '3754', 10);
 const UI_HTML           = path.join(__dirname, 'src', 'web', 'ui.html');
 const PERPLEXITY_KEY    = process.env.PERPLEXITY_API_KEY ?? '';
 const PERPLEXITY_MODEL  = 'sonar';

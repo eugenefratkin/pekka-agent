@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node mock-server.js",
+    "start": "PORT=3754 node mock-server.js",
     "test": "playwright test",
     "test:ui": "playwright test tests/ui.spec.js",
     "test:api": "playwright test tests/api.spec.js",
