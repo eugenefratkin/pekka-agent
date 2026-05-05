@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>pekka-llm</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -68,6 +69,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
 .msg.sys {align-self:center;background:transparent;color:var(--muted);font-size:11px;max-width:100%;text-align:center}
 .msg.err {align-self:flex-start;background:#2d1b1b;color:var(--err);border:1px solid #5c2020;border-radius:8px}
 .msg-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}
+/* ── Markdown rendering inside bot messages ── */
+.msg.bot h1,.msg.bot h2,.msg.bot h3{font-weight:600;margin:10px 0 4px;line-height:1.3}
+.msg.bot h1{font-size:15px}.msg.bot h2{font-size:14px}.msg.bot h3{font-size:13px}
+.msg.bot p{margin:4px 0;line-height:1.6}
+.msg.bot ul,.msg.bot ol{margin:4px 0 4px 18px;line-height:1.7}
+.msg.bot li{margin:1px 0}
+.msg.bot strong{font-weight:600;color:#e6edf3}
+.msg.bot em{font-style:italic;color:#c9d1d9}
+.msg.bot code{font-family:ui-monospace,monospace;font-size:12px;background:#0d1117;padding:1px 5px;border-radius:4px;color:#79c0ff}
+.msg.bot pre{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:10px 12px;overflow-x:auto;margin:6px 0}
+.msg.bot pre code{background:none;padding:0;color:#e6edf3;font-size:12px}
+.msg.bot blockquote{border-left:3px solid var(--border);margin:6px 0;padding-left:10px;color:var(--muted)}
+.msg.bot a{color:var(--accent2);text-decoration:none}.msg.bot a:hover{text-decoration:underline}
+.msg.bot hr{border:none;border-top:1px solid var(--border);margin:8px 0}
 
 /* ── Agent loop panel ───────────────────────────────────── */
 .loop-panel{
@@ -479,7 +494,7 @@ function addMsg(type, text) {
     el.innerHTML = `<div class="msg-label">You</div>${esc(text)}`;
   } else {
     el.className = 'msg bot';
-    el.innerHTML = `<div class="msg-label">Assistant</div>${esc(text).replace(/\n/g,'<br>')}`;
+    el.innerHTML = `<div class="msg-label">Assistant</div>${marked.parse(text)}`;
   }
   $h.appendChild(el);
   $h.scrollTop = $h.scrollHeight;
