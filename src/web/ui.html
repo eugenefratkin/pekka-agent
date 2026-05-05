@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pekka-llm</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117; --s1:#161b22; --s2:#21262d; --border:#30363d;
+  --text:#e6edf3; --muted:#7d8590; --accent:#7c3aed; --accent2:#58a6ff;
+  --think:#a78bfa; --act:#f59e0b; --observe:#34d399; --tool:#fb923c;
+  --session:#60a5fa; --iter:#c084fc; --ok:#3fb950; --err:#f85149;
+  font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;overflow:hidden}
+
+/* ── App shell ─────────────────────────────────────────── */
+.app{display:grid;grid-template-rows:48px 1fr;height:100vh}
+
+/* ── Topbar ─────────────────────────────────────────────── */
+.topbar{
+  display:flex;align-items:center;gap:12px;padding:0 20px;
+  background:var(--s1);border-bottom:1px solid var(--border);
+  position:relative;z-index:10;
+}
+.logo{font-weight:700;font-size:14px;letter-spacing:-.3px;color:var(--text)}
+.logo span{color:var(--accent)}
+.topbar-tabs{display:flex;gap:2px;margin-left:auto}
+.tab{
+  padding:6px 14px;border-radius:6px;border:none;cursor:pointer;
+  font-size:12px;font-weight:500;background:transparent;color:var(--muted);
+  transition:background .15s,color .15s;
+}
+.tab.active,.tab:hover{background:var(--s2);color:var(--text)}
+.topbar-right{display:flex;align-items:center;gap:10px;margin-left:16px}
+.pill{
+  font-size:11px;padding:3px 10px;border-radius:99px;
+  background:var(--s2);border:1px solid var(--border);color:var(--muted);
+}
+.pill.ok{border-color:#238636;color:var(--ok)}
+.btn{
+  padding:5px 12px;border-radius:6px;border:1px solid var(--border);
+  background:var(--s2);color:var(--text);cursor:pointer;font-size:12px;
+  font-weight:500;transition:background .15s;white-space:nowrap;
+}
+.btn:hover{background:#292e36}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{opacity:.88}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* ── Main split ─────────────────────────────────────────── */
+.main{display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
+
+/* ── Panel ──────────────────────────────────────────────── */
+.panel{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+.panel-head{
+  padding:10px 16px;border-bottom:1px solid var(--border);
+  background:var(--s1);display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+.panel-head h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+
+/* ── Chat history ───────────────────────────────────────── */
+.history{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;min-height:0}
+.msg{padding:10px 14px;border-radius:8px;max-width:88%;line-height:1.6}
+.msg.user{align-self:flex-end;background:#1c2d4a;border-bottom-right-radius:2px}
+.msg.bot {align-self:flex-start;background:var(--s2);border-bottom-left-radius:2px}
+.msg.sys {align-self:center;background:transparent;color:var(--muted);font-size:11px;max-width:100%;text-align:center}
+.msg.err {align-self:flex-start;background:#2d1b1b;color:var(--err);border:1px solid #5c2020;border-radius:8px}
+.msg-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}
+
+/* ── Agent loop panel ───────────────────────────────────── */
+.loop-panel{
+  flex-shrink:0;border-top:1px solid var(--border);
+  max-height:0;overflow:hidden;transition:max-height .3s ease;
+}
+.loop-panel.open{max-height:260px}
+.loop-head{
+  padding:7px 16px;background:var(--s1);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;
+}
+.loop-head span{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.loop-badge{
+  font-size:10px;padding:2px 7px;border-radius:99px;
+  background:var(--s2);border:1px solid var(--border);color:var(--muted);margin-left:auto;
+}
+.loop-body{overflow-y:auto;max-height:220px;padding:8px 12px;display:flex;flex-direction:column;gap:6px}
+
+.step{
+  display:flex;align-items:flex-start;gap:10px;padding:7px 10px;
+  border-radius:6px;background:var(--s2);border:1px solid var(--border);
+  animation:fadeIn .2s ease;
+}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.step-icon{font-size:14px;flex-shrink:0;margin-top:1px}
+.step-body{flex:1;min-width:0}
+.step-title{font-weight:600;font-size:12px;color:var(--text)}
+.step-sub{font-size:11px;color:var(--muted);margin-top:2px;word-break:break-all}
+.step-badge{
+  font-size:10px;padding:2px 7px;border-radius:99px;flex-shrink:0;
+  font-weight:600;align-self:center;
+}
+.badge-think  {background:#1e1b4b;color:var(--think);border:1px solid #312e81}
+.badge-act    {background:#1c1407;color:var(--act);border:1px solid #78350f}
+.badge-tool   {background:#1c0e04;color:var(--tool);border:1px solid #7c2d12}
+.badge-observe{background:#022c22;color:var(--observe);border:1px solid #064e3b}
+.badge-ok     {background:#0a1f0a;color:var(--ok);border:1px solid #14532d}
+.badge-err    {background:#1c0a0a;color:var(--err);border:1px solid #7f1d1d}
+.badge-iter   {background:#1a0533;color:var(--iter);border:1px solid #4c1d95}
+.pulse::after{content:'…';animation:pulse 1s steps(3,end) infinite}
+@keyframes pulse{0%{content:''}33%{content:'.'}66%{content:'..'}100%{content:'...'}}
+
+/* ── Input bar ──────────────────────────────────────────── */
+.input-bar{
+  padding:12px 14px;border-top:1px solid var(--border);
+  background:var(--s1);display:flex;gap:8px;align-items:center;flex-shrink:0;
+}
+.input-bar input{
+  flex:1;padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);font-size:13px;outline:none;transition:border .15s;
+}
+.input-bar input:focus{border-color:var(--accent)}
+.input-bar input::placeholder{color:var(--muted)}
+
+/* ── Trace panel ────────────────────────────────────────── */
+.trace-panel{display:flex;flex-direction:column;overflow:hidden}
+.trace-body{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0}
+
+.trace-card{
+  background:var(--s1);border:1px solid var(--border);border-radius:8px;overflow:hidden;
+}
+.trace-card-head{
+  padding:8px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;
+  border-bottom:1px solid var(--border);user-select:none;
+}
+.trace-card-head:hover{background:rgba(255,255,255,.03)}
+.trace-tid{font-size:11px;font-family:monospace;color:var(--muted)}
+.trace-dur{font-size:11px;color:var(--muted);margin-left:auto}
+.chevron{color:var(--muted);font-size:9px;transition:transform .2s;flex-shrink:0}
+.trace-card.collapsed .chevron{transform:rotate(-90deg)}
+.trace-card.collapsed .trace-spans{display:none}
+
+.trace-spans{padding:6px 0}
+.span-row{
+  display:grid;grid-template-columns:180px 1fr 52px;
+  align-items:center;gap:8px;
+  padding:4px 12px 4px calc(12px + var(--depth,0) * 16px);
+  cursor:pointer;transition:background .1s;
+}
+.span-row:hover,.span-row.selected{background:rgba(255,255,255,.04)}
+.span-row.selected{background:rgba(124,58,237,.12)}
+.span-name{
+  font-size:11px;font-weight:500;display:flex;align-items:center;
+  gap:6px;overflow:hidden;white-space:nowrap;
+}
+.span-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.span-name-text{overflow:hidden;text-overflow:ellipsis}
+.bar-track{height:8px;background:rgba(255,255,255,.05);border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;min-width:2px}
+.span-dur{font-size:10px;color:var(--muted);text-align:right}
+
+/* Span colour classes */
+.c-session{background:var(--session)}.c-iter{background:var(--iter)}
+.c-think{background:var(--think)}.c-act{background:var(--act)}
+.c-observe{background:var(--observe)}.c-tool{background:var(--tool)}
+.c-other{background:var(--muted)}
+
+/* ── Span detail drawer ─────────────────────────────────── */
+.detail-drawer{
+  flex-shrink:0;border-top:1px solid var(--border);background:var(--s1);
+  max-height:0;overflow:hidden;transition:max-height .25s ease;
+}
+.detail-drawer.open{max-height:200px}
+.detail-head{
+  padding:7px 14px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;
+}
+.detail-head span{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.detail-close{margin-left:auto;cursor:pointer;color:var(--muted);font-size:16px;line-height:1;padding:2px 4px}
+.detail-close:hover{color:var(--text)}
+.detail-body{padding:10px 14px;overflow-y:auto;max-height:160px}
+.attr-table{width:100%;border-collapse:collapse}
+.attr-table tr:not(:last-child) td{padding-bottom:4px}
+.attr-table td:first-child{
+  font-size:11px;color:var(--muted);width:44%;padding-right:10px;
+  font-family:monospace;white-space:nowrap;
+}
+.attr-table td:last-child{font-size:11px;color:var(--text);word-break:break-all}
+
+/* ── Legend ─────────────────────────────────────────────── */
+.legend{
+  flex-shrink:0;display:flex;flex-wrap:wrap;gap:10px;padding:8px 14px;
+  border-top:1px solid var(--border);background:var(--s1);
+}
+.legend-item{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted)}
+.legend-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+
+/* ── Scrollbar ──────────────────────────────────────────── */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- ── Topbar ── -->
+<div class="topbar">
+  <div class="logo">◆ <span>pekka</span>-llm</div>
+  <div class="topbar-tabs">
+    <button class="tab active" onclick="switchTab('agent')">Agent Loop</button>
+    <button class="tab"        onclick="switchTab('traces')">Traces</button>
+  </div>
+  <div class="topbar-right">
+    <div class="pill" id="sseStatus">● disconnected</div>
+    <div class="pill" id="sessionPill">no session</div>
+    <button class="btn" id="btnNew">+ New session</button>
+  </div>
+</div>
+
+<!-- ── Main ── -->
+<div class="main">
+
+  <!-- ── Left: Agent Loop ── -->
+  <div class="panel" id="agentPanel">
+    <div class="panel-head">
+      <h3>Conversation</h3>
+    </div>
+    <div class="history" id="history"></div>
+
+    <!-- Live agent loop steps -->
+    <div class="loop-panel" id="loopPanel">
+      <div class="loop-head">
+        <span>Agent Loop</span>
+        <span class="loop-badge" id="loopBadge">idle</span>
+      </div>
+      <div class="loop-body" id="loopBody"></div>
+    </div>
+
+    <div class="input-bar">
+      <input id="msgInput" type="text" placeholder="Ask something…" autocomplete="off"/>
+      <button class="btn primary" id="btnSend" disabled>Send</button>
+      <button class="btn"         id="btnCancel" disabled>Cancel</button>
+    </div>
+  </div>
+
+  <!-- ── Right: Traces ── -->
+  <div class="trace-panel" id="tracesPanel">
+    <div class="panel-head">
+      <h3>Execution Traces</h3>
+      <button class="btn" id="btnClear" style="margin-left:auto;font-size:11px;padding:4px 9px">Clear</button>
+    </div>
+    <div class="trace-body" id="traceBody">
+      <p style="color:var(--muted);font-size:12px;text-align:center;margin-top:40px">
+        Spans will appear here as the agent executes.
+      </p>
+    </div>
+    <!-- Span detail drawer -->
+    <div class="detail-drawer" id="detailDrawer">
+      <div class="detail-head">
+        <span id="detailTitle">span details</span>
+        <span class="detail-close" onclick="closeDetail()">✕</span>
+      </div>
+      <div class="detail-body">
+        <table class="attr-table" id="detailTable"></table>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot c-session"></div>session</div>
+      <div class="legend-item"><div class="legend-dot c-iter"></div>iteration</div>
+      <div class="legend-item"><div class="legend-dot c-think"></div>think</div>
+      <div class="legend-item"><div class="legend-dot c-act"></div>act</div>
+      <div class="legend-item"><div class="legend-dot c-observe"></div>observe</div>
+      <div class="legend-item"><div class="legend-dot c-tool"></div>tool.call</div>
+    </div>
+  </div>
+
+</div><!-- .main -->
+</div><!-- .app -->
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════
+let sessionId   = null;
+let sending     = false;
+let abortCtrl   = new AbortController();
+const traces    = new Map(); // traceId → {spans:Map, card, startMs, endMs}
+let selectedRow = null;
+
+// ═══════════════════════════════════════════════════════════════
+// Tabs
+// ═══════════════════════════════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    t.classList.toggle('active', (i===0) === (name==='agent'));
+  });
+  // On mobile we'd hide panels; on desktop both are always visible
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Session
+// ═══════════════════════════════════════════════════════════════
+async function createSession() {
+  const res = await fetch('/api/session', { method:'POST' });
+  if (!res.ok) throw new Error(await res.text());
+  const { session_id } = await res.json();
+  sessionId = session_id;
+  document.getElementById('sessionPill').textContent = '● ' + session_id.slice(0,8);
+  document.getElementById('sessionPill').style.color = 'var(--ok)';
+  document.getElementById('btnSend').disabled = false;
+  addMsg('sys', `Session ${session_id.slice(0,8)}… started`);
+}
+
+document.getElementById('btnNew').addEventListener('click', async () => {
+  sessionId = null;
+  document.getElementById('history').innerHTML = '';
+  document.getElementById('loopBody').innerHTML = '';
+  closeLoopPanel();
+  await createSession().catch(e => addMsg('err', 'Could not create session: ' + e.message));
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Chat + streaming agent loop
+// ═══════════════════════════════════════════════════════════════
+document.getElementById('btnSend').addEventListener('click', sendMessage);
+document.getElementById('msgInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) sendMessage();
+});
+document.getElementById('btnCancel').addEventListener('click', cancel);
+
+async function sendMessage() {
+  const text = document.getElementById('msgInput').value.trim();
+  if (!text || sending || !sessionId) return;
+
+  sending = true;
+  setSending(true);
+  document.getElementById('msgInput').value = '';
+
+  addMsg('user', text);
+  openLoopPanel();
+  document.getElementById('loopBody').innerHTML = '';
+  document.getElementById('loopBadge').textContent = 'running';
+
+  abortCtrl = new AbortController();
+
+  try {
+    const res = await fetch(`/api/session/${sessionId}/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+      signal: abortCtrl.signal,
+    });
+
+    if (!res.ok) {
+      addMsg('err', await res.text());
+      return;
+    }
+
+    // Parse SSE stream manually (fetch + ReadableStream)
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const frames = buf.split('\n\n');
+      buf = frames.pop();
+      for (const frame of frames) {
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try { handleAgentEvent(JSON.parse(line.slice(6))); } catch {}
+          }
+        }
+      }
+    }
+  } catch(e) {
+    if (e.name !== 'AbortError') addMsg('err', e.message);
+    else addMsg('sys', 'Request cancelled.');
+  } finally {
+    sending = false;
+    setSending(false);
+    document.getElementById('loopBadge').textContent = 'idle';
+    setTimeout(closeLoopPanel, 2000);
+  }
+}
+
+async function cancel() {
+  abortCtrl.abort();
+  if (sessionId) {
+    await fetch(`/api/session/${sessionId}/cancel`, { method:'DELETE' }).catch(()=>{});
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Agent event rendering
+// ═══════════════════════════════════════════════════════════════
+function handleAgentEvent(ev) {
+  switch (ev.type) {
+    case 'iteration_start':
+      addStep('iter', `Iteration ${ev.iteration + 1}`, '', 'badge-iter');
+      break;
+
+    case 'think_start':
+      addStep('think', '🧠 Thinking', '', 'badge-think pulse', 'thinking-step');
+      break;
+
+    case 'think_done': {
+      const el = document.getElementById('thinking-step');
+      if (el) {
+        el.querySelector('.step-title').textContent = '🧠 Thought';
+        el.querySelector('.step-title').classList.remove('pulse');
+        if (ev.partial_text) {
+          el.querySelector('.step-sub').textContent = ev.partial_text.slice(0, 160) + (ev.partial_text.length > 160 ? '…' : '');
+        }
+      }
+      break;
+    }
+
+    case 'act_start':
+      addStep('act', `⚡ Calling ${ev.num_tools} tool${ev.num_tools!==1?'s':''}`, '', 'badge-act');
+      break;
+
+    case 'tool_call_start':
+      addStep('tool', `🔧 ${ev.name}`,
+        'args: ' + JSON.stringify(ev.args).slice(0, 100),
+        'badge-tool pulse', 'tool-' + ev.call_id);
+      break;
+
+    case 'tool_call_done': {
+      const el = document.getElementById('tool-' + ev.call_id);
+      if (el) {
+        el.querySelector('.step-badge').classList.remove('pulse');
+        el.querySelector('.step-badge').className = 'step-badge ' + (ev.success ? 'badge-ok' : 'badge-err');
+        el.querySelector('.step-badge').textContent = ev.success ? '✓' : '✗';
+        el.querySelector('.step-sub').textContent =
+          'result: ' + ev.result.slice(0, 120) + (ev.result.length > 120 ? '…' : '');
+      }
+      break;
+    }
+
+    case 'observe_done':
+      addStep('observe', '👁 Observing results', '', 'badge-observe');
+      break;
+
+    case 'final_answer':
+      addMsg('bot', ev.content);
+      closeLoopPanel();
+      break;
+
+    case 'cancelled':
+      addMsg('sys', 'Cancelled.');
+      break;
+
+    case 'error':
+      addMsg('err', ev.message);
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI helpers — history
+// ═══════════════════════════════════════════════════════════════
+function addMsg(type, text) {
+  const $h = document.getElementById('history');
+  const el = document.createElement('div');
+  if (type === 'sys') {
+    el.className = 'msg sys';
+    el.textContent = text;
+  } else if (type === 'err') {
+    el.className = 'msg err';
+    el.innerHTML = `<div class="msg-label">Error</div>${esc(text)}`;
+  } else if (type === 'user') {
+    el.className = 'msg user';
+    el.innerHTML = `<div class="msg-label">You</div>${esc(text)}`;
+  } else {
+    el.className = 'msg bot';
+    el.innerHTML = `<div class="msg-label">Assistant</div>${esc(text).replace(/\n/g,'<br>')}`;
+  }
+  $h.appendChild(el);
+  $h.scrollTop = $h.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI helpers — loop steps
+// ═══════════════════════════════════════════════════════════════
+function addStep(type, title, sub, badgeClass, id) {
+  const $b = document.getElementById('loopBody');
+  const el = document.createElement('div');
+  el.className = 'step';
+  if (id) el.id = id;
+  el.innerHTML = `
+    <div class="step-body">
+      <div class="step-title${badgeClass.includes('pulse') ? ' pulse' : ''}">${esc(title)}</div>
+      ${sub ? `<div class="step-sub">${esc(sub)}</div>` : ''}
+    </div>
+    <div class="step-badge ${badgeClass}">${badgeClass.includes('pulse') ? '…' : type}</div>`;
+  $b.appendChild(el);
+  $b.scrollTop = $b.scrollHeight;
+}
+
+function openLoopPanel()  { document.getElementById('loopPanel').classList.add('open'); }
+function closeLoopPanel() { document.getElementById('loopPanel').classList.remove('open'); }
+
+// ═══════════════════════════════════════════════════════════════
+// UI helpers — buttons
+// ═══════════════════════════════════════════════════════════════
+function setSending(on) {
+  document.getElementById('btnSend').disabled   = on;
+  document.getElementById('btnCancel').disabled = !on;
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OTel span events  (SSE from /events/spans)
+// ═══════════════════════════════════════════════════════════════
+function connectSpanSSE() {
+  const es = new EventSource('/events/spans');
+  const $s = document.getElementById('sseStatus');
+
+  es.onopen = () => {
+    $s.textContent = '● connected';
+    $s.classList.add('ok');
+  };
+  es.onerror = () => {
+    $s.textContent = '● disconnected';
+    $s.classList.remove('ok');
+  };
+  es.addEventListener('span', e => {
+    try { ingestSpan(JSON.parse(e.data)); } catch {}
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Trace waterfall
+// ═══════════════════════════════════════════════════════════════
+function spanColor(name) {
+  if (name==='react.session')   return 'c-session';
+  if (name==='react.iteration') return 'c-iter';
+  if (name==='react.think')     return 'c-think';
+  if (name==='react.act')       return 'c-act';
+  if (name==='react.observe')   return 'c-observe';
+  if (name==='tool.call')       return 'c-tool';
+  return 'c-other';
+}
+
+function fmtDur(ms) {
+  return ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(2) + 's';
+}
+
+function ingestSpan(span) {
+  // Clear the placeholder if first span ever
+  const $tb = document.getElementById('traceBody');
+  if ($tb.querySelector('p')) $tb.innerHTML = '';
+
+  let trace = traces.get(span.trace_id);
+  if (!trace) {
+    const card = document.createElement('div');
+    card.className = 'trace-card';
+    card.innerHTML = `
+      <div class="trace-card-head">
+        <span class="trace-tid" title="${span.trace_id}">
+          ${span.trace_id.slice(0,8)}…${span.trace_id.slice(-4)}
+        </span>
+        <span class="trace-dur" id="tdur-${span.trace_id}"></span>
+        <span class="chevron">▾</span>
+      </div>
+      <div class="trace-spans" id="tspans-${span.trace_id}"></div>`;
+    card.querySelector('.trace-card-head').addEventListener('click', () =>
+      card.classList.toggle('collapsed'));
+    $tb.prepend(card);
+    trace = { card, spans: new Map(), startMs: span.start_ms, endMs: span.end_ms };
+    traces.set(span.trace_id, trace);
+  }
+  trace.spans.set(span.span_id, span);
+  if (span.start_ms < trace.startMs) trace.startMs = span.start_ms;
+  if (span.end_ms   > trace.endMs)   trace.endMs   = span.end_ms;
+  renderTrace(span.trace_id, trace);
+}
+
+function renderTrace(tid, trace) {
+  const totalMs = Math.max(trace.endMs - trace.startMs, 1);
+  const $spans  = document.getElementById('tspans-' + tid);
+  const $dur    = document.getElementById('tdur-' + tid);
+  if ($dur) $dur.textContent = fmtDur(totalMs);
+
+  // Build children map
+  const children = new Map();
+  for (const s of trace.spans.values()) {
+    const pid = s.parent_span_id || '__root__';
+    if (!children.has(pid)) children.set(pid, []);
+    children.get(pid).push(s);
+  }
+  for (const arr of children.values()) arr.sort((a,b) => a.start_ms - b.start_ms);
+
+  $spans.innerHTML = '';
+
+  function renderSpan(span, depth) {
+    const offset = ((span.start_ms - trace.startMs) / totalMs * 100).toFixed(1);
+    const width  = Math.max((span.duration_ms / totalMs * 100), .3).toFixed(1);
+    const color  = spanColor(span.name);
+
+    const row = document.createElement('div');
+    row.className = 'span-row';
+    row.style.setProperty('--depth', depth);
+    row.dataset.spanId = span.span_id;
+
+    row.innerHTML = `
+      <div class="span-name">
+        <div class="span-dot ${color}"></div>
+        <span class="span-name-text">${esc(span.name)}</span>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill ${color}" style="margin-left:${offset}%;width:${width}%"></div>
+      </div>
+      <div class="span-dur">${fmtDur(span.duration_ms)}</div>`;
+
+    row.addEventListener('click', () => showDetail(span, row));
+    $spans.appendChild(row);
+
+    for (const child of (children.get(span.span_id) || [])) renderSpan(child, depth+1);
+  }
+
+  const roots = [...trace.spans.values()]
+    .filter(s => !s.parent_span_id || !trace.spans.has(s.parent_span_id))
+    .sort((a,b) => a.start_ms - b.start_ms);
+  roots.forEach(r => renderSpan(r, 0));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Span detail drawer
+// ═══════════════════════════════════════════════════════════════
+function showDetail(span, row) {
+  // Deselect old
+  if (selectedRow) selectedRow.classList.remove('selected');
+  selectedRow = row;
+  row.classList.add('selected');
+
+  document.getElementById('detailTitle').textContent = span.name;
+
+  const rows = [
+    ['trace_id',    span.trace_id],
+    ['span_id',     span.span_id],
+    ['parent',      span.parent_span_id || '—'],
+    ['start',       new Date(span.start_ms).toISOString().slice(11,23)],
+    ['duration',    fmtDur(span.duration_ms)],
+    ['status',      span.status],
+    ...Object.entries(span.attributes || {}),
+  ];
+
+  document.getElementById('detailTable').innerHTML =
+    rows.map(([k,v]) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join('');
+
+  document.getElementById('detailDrawer').classList.add('open');
+}
+
+function closeDetail() {
+  if (selectedRow) { selectedRow.classList.remove('selected'); selectedRow = null; }
+  document.getElementById('detailDrawer').classList.remove('open');
+}
+
+document.getElementById('btnClear').addEventListener('click', () => {
+  traces.clear();
+  document.getElementById('traceBody').innerHTML =
+    '<p style="color:var(--muted);font-size:12px;text-align:center;margin-top:40px">Spans will appear here as the agent executes.</p>';
+  closeDetail();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════
+(async () => {
+  connectSpanSSE();
+  await createSession().catch(e =>
+    addMsg('err', 'Could not create session: ' + e.message));
+  document.getElementById('msgInput').focus();
+})();
+</script>
+</body>
+</html>
