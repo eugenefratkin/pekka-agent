@@ -56,7 +56,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
 .main{display:grid;grid-template-columns:1fr;overflow:hidden}
 .main.split{grid-template-columns:1fr 1fr}
 .trace-panel{display:none}
-.main.split .trace-panel{display:flex}
+.main.split .trace-panel{display:flex;flex-direction:column}
 
 /* ── Panel ──────────────────────────────────────────────── */
 .panel{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
@@ -159,7 +159,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
 .input-bar input::placeholder{color:var(--muted)}
 
 /* ── Trace panel ────────────────────────────────────────── */
-.trace-panel{display:flex;flex-direction:column;overflow:hidden}
+.trace-panel{flex-direction:column;overflow:hidden}
 .trace-body{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0}
 
 .trace-card{
