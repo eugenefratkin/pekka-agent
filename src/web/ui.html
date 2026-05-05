@@ -244,6 +244,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
     <button class="tab"        onclick="switchTab('traces')">Traces</button>
   </div>
   <div class="topbar-right">
+    <select id="providerSelect" class="btn" style="padding:5px 8px;cursor:pointer" title="Reasoning model"></select>
+    <select id="modelSelect"    class="btn" style="padding:5px 8px;cursor:pointer" title="Model"></select>
     <div class="pill" id="sseStatus">● disconnected</div>
     <div class="pill" id="sessionPill">no session</div>
     <button class="btn" id="btnNew">+ New session</button>
@@ -754,6 +756,51 @@ document.getElementById('btnClear').addEventListener('click', () => {
   closeDetail();
 });
 
+// ── Provider / model selector ─────────────────────────────────────────────
+async function loadProviders() {
+  try {
+    const data = await fetch('/api/providers').then(r => r.json());
+    const $p = document.getElementById('providerSelect');
+    const $m = document.getElementById('modelSelect');
+
+    function populateModels(providerId) {
+      const prov = data.providers.find(p => p.id === providerId);
+      $m.innerHTML = '';
+      if (!prov) return;
+      for (const m of prov.models) {
+        const opt = document.createElement('option');
+        opt.value = m; opt.textContent = m;
+        if (m === data.active.model) opt.selected = true;
+        $m.appendChild(opt);
+      }
+    }
+
+    for (const p of data.providers) {
+      const opt = document.createElement('option');
+      opt.value = p.id; opt.textContent = p.name;
+      if (p.id === data.active.provider) opt.selected = true;
+      $p.appendChild(opt);
+    }
+    populateModels(data.active.provider);
+
+    $p.addEventListener('change', () => {
+      populateModels($p.value);
+      selectProvider($p.value, $m.value);
+    });
+    $m.addEventListener('change', () => selectProvider($p.value, $m.value));
+  } catch(e) { console.warn('Could not load providers', e); }
+}
+
+async function selectProvider(provider, model) {
+  try {
+    await fetch('/api/providers/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, model }),
+    });
+  } catch(e) { console.warn('Could not select provider', e); }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Boot
 // ═══════════════════════════════════════════════════════════════
@@ -770,6 +817,7 @@ document.getElementById('btnClear').addEventListener('click', () => {
   } catch {}
 
   connectSpanSSE();
+  loadProviders();
   await createSession().catch(e =>
     addMsg('err', 'Could not create session: ' + e.message));
   document.getElementById('msgInput').focus();

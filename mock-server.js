@@ -34,6 +34,56 @@ const OPENAI_KEY        = process.env.OPENAI_API_KEY ?? '';
 const OPENAI_MODEL      = process.env.OPENAI_MODEL ?? 'gpt-4o';
 const OPENAI_URL        = 'https://api.openai.com/v1/chat/completions';
 
+// ─── Reasoning provider config ────────────────────────────────────────────────
+const PROVIDERS = {
+  openai: {
+    name: 'OpenAI',
+    key: process.env.OPENAI_API_KEY ?? '',
+    url: 'https://api.openai.com/v1/chat/completions',
+    models: ['gpt-4o', 'gpt-4o-mini', 'o3', 'o4-mini'],
+    defaultModel: 'gpt-4o',
+  },
+  anthropic: {
+    name: 'Anthropic',
+    key: process.env.ANTHROPIC_API_KEY ?? '',
+    url: 'https://api.anthropic.com/v1/messages',
+    models: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    defaultModel: 'claude-sonnet-4-6',
+  },
+  grok: {
+    name: 'Grok',
+    key: process.env.GROK_API_KEY ?? '',
+    url: 'https://api.x.ai/v1/chat/completions',
+    models: ['grok-3', 'grok-3-mini', 'grok-2'],
+    defaultModel: 'grok-3',
+  },
+  gemini: {
+    name: 'Gemini',
+    key: process.env.GEMINI_API_KEY ?? '',
+    url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    models: ['gemini-2.5-pro-preview-05-06', 'gemini-2.5-flash-preview-04-17', 'gemini-2.0-flash'],
+    defaultModel: 'gemini-2.5-pro-preview-05-06',
+  },
+  inception: {
+    name: 'Inception',
+    key: process.env.INCEPTION_API_KEY ?? '',
+    url: 'https://api.inceptionlabs.ai/v1/chat/completions',
+    models: ['mercury-coder-small', 'mercury-coder'],
+    defaultModel: 'mercury-coder-small',
+  },
+  perplexity: {
+    name: 'Perplexity',
+    key: process.env.PERPLEXITY_API_KEY ?? '',
+    url: 'https://api.perplexity.ai/chat/completions',
+    models: ['sonar-pro', 'sonar-reasoning-pro', 'sonar-reasoning', 'sonar'],
+    defaultModel: 'sonar-pro',
+  },
+};
+
+// Active reasoning provider — can be overridden per-request via POST body { provider, model }
+let activeProvider = process.env.REASONING_PROVIDER ?? 'openai';
+let activeModel    = process.env.REASONING_MODEL    ?? PROVIDERS[activeProvider]?.defaultModel ?? 'gpt-4o';
+
 // ─── Auth config ──────────────────────────────────────────────────────────────
 
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     ?? '';
@@ -263,26 +313,51 @@ async function callPerplexity(query, systemPrompt = 'Be precise and concise.', h
 }
 
 /**
- * Call OpenAI chat completions for reasoning steps (planning, synthesis).
- * Returns the assistant message content, or throws on error.
+ * Call the reasoning LLM (OpenAI-compatible chat completions interface).
+ * Anthropic uses a different API format so it's handled separately.
  */
-async function callOpenAI(messages) {
-  if (!OPENAI_KEY) return null;
+async function callReasoning(messages, provider = activeProvider, model = activeModel) {
+  const cfg = PROVIDERS[provider];
+  if (!cfg?.key) return null;
 
-  const res = await fetch(OPENAI_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_KEY}`,
-      'Content-Type':  'application/json',
-    },
-    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text().catch(() => '');
-    throw new Error(`OpenAI ${res.status}: ${err}`);
+  // Anthropic uses a different wire format
+  if (provider === 'anthropic') {
+    const systemMsg = messages.find(m => m.role === 'system');
+    const userMsgs  = messages.filter(m => m.role !== 'system');
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key':         cfg.key,
+        'anthropic-version': '2023-06-01',
+        'Content-Type':      'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 4096,
+        system: systemMsg?.content ?? 'You are a helpful assistant.',
+        messages: userMsgs,
+      }),
+    });
+    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text().catch(() => '')}`);
+    const data = await res.json();
+    return data.content?.[0]?.text ?? null;
   }
 
+  // Gemini via OpenAI-compatible endpoint needs API key as query param
+  const url = provider === 'gemini'
+    ? `${cfg.url}?key=${cfg.key}`
+    : cfg.url;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      ...(provider !== 'gemini' ? { 'Authorization': `Bearer ${cfg.key}` } : {}),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ model, messages }),
+  });
+
+  if (!res.ok) throw new Error(`${cfg.name} ${res.status}: ${await res.text().catch(() => '')}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content ?? null;
 }
@@ -619,7 +694,7 @@ async function streamScenario(res, message, sessionId, model) {
 
   let followUpQueries = [];
   try {
-    const planContent = await callOpenAI([
+    const planContent = await callReasoning([
       { role: 'system', content:
           'You are a research planner. Given prior conversation, an original question, and ' +
           'discovery results, identify specific entities (companies, people, topics, products) ' +
@@ -717,7 +792,7 @@ async function streamScenario(res, message, sessionId, model) {
 
   let finalAnswer = null;
   try {
-    finalAnswer = await callOpenAI([
+    finalAnswer = await callReasoning([
       { role: 'system', content:
           'You are a helpful research assistant. Synthesise the provided research results into ' +
           'one clear, well-structured answer. Use markdown. Integrate information naturally — ' +
@@ -983,6 +1058,28 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── GET /api/providers ──────────────────────────────────────────────────────
+  if (method === 'GET' && url === '/api/providers') {
+    const available = Object.entries(PROVIDERS)
+      .filter(([, cfg]) => cfg.key)
+      .map(([id, cfg]) => ({ id, name: cfg.name, models: cfg.models, defaultModel: cfg.defaultModel }));
+    json(res, 200, { providers: available, active: { provider: activeProvider, model: activeModel } });
+    return;
+  }
+
+  // ── POST /api/providers/select ──────────────────────────────────────────────
+  if (method === 'POST' && url === '/api/providers/select') {
+    let body;
+    try { body = await parseBody(req); } catch { res.writeHead(400); res.end('bad json'); return; }
+    const { provider, model } = body;
+    if (!PROVIDERS[provider]) { json(res, 400, { error: 'unknown provider' }); return; }
+    activeProvider = provider;
+    activeModel    = model ?? PROVIDERS[provider].defaultModel;
+    console.log(`[provider] switched to ${activeProvider} / ${activeModel}`);
+    json(res, 200, { provider: activeProvider, model: activeModel });
+    return;
+  }
+
   // ── GET / → serve ui.html ───────────────────────────────────────────────────
   if (method === 'GET' && (url === '/' || url === '/index.html')) {
     try {
@@ -1077,7 +1174,12 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`    • Parallel Perplexity searches (2-3 sub-queries simultaneously)`);
   console.log(`    • Sentiment observer agent (anger → psychologist mode)`);
   console.log(`    • Session conversation history (Perplexity sees prior context)`);
-  console.log(`\n  Reasoning:  ${OPENAI_KEY   ? `OpenAI ${OPENAI_MODEL}` : 'DISABLED (set OPENAI_API_KEY)'}`);
-  console.log(`  Retrieval:  ${PERPLEXITY_KEY ? `Perplexity ${PERPLEXITY_MODEL}` : 'DISABLED (set PERPLEXITY_API_KEY)'}`);
+  console.log('\n  Reasoning providers available:');
+  for (const [id, cfg] of Object.entries(PROVIDERS)) {
+    if (id === 'perplexity') continue; // shown separately as retrieval
+    console.log(`    ${cfg.key ? '✓' : '✗'} ${cfg.name}`);
+  }
+  console.log(`  Active: ${activeProvider} / ${activeModel}`);
+  console.log(`\n  Retrieval: ${PERPLEXITY_KEY ? `Perplexity ${PERPLEXITY_MODEL}` : 'DISABLED (set PERPLEXITY_API_KEY)'}`);
   console.log();
 });
