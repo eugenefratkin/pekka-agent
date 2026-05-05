@@ -53,7 +53,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
 .btn:disabled{opacity:.4;cursor:not-allowed}
 
 /* ── Main split ─────────────────────────────────────────── */
-.main{display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
+.main{display:grid;grid-template-columns:1fr;overflow:hidden}
+.main.split{grid-template-columns:1fr 1fr}
+.trace-panel{display:none}
+.main.split .trace-panel{display:flex}
 
 /* ── Panel ──────────────────────────────────────────────── */
 .panel{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
@@ -245,9 +248,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
   /* Compact provider selects */
   #providerSelect,#modelSelect{max-width:110px;font-size:11px;padding:4px 6px}
 
-  /* Stack panels: show only the active one */
-  .main{grid-template-columns:1fr}
-  .trace-panel{display:none}
+  /* Stack panels: chat always full width */
+  .main,.main.split{grid-template-columns:1fr}
   .panel{border-right:none}
 
   /* Span row: narrower name column */
@@ -365,8 +367,12 @@ function switchTab(name) {
     t.classList.toggle('active', (i===0) === (name==='agent'));
   });
   if (window.innerWidth <= 700) {
+    // Mobile: swap panels
     document.getElementById('agentPanel').style.display  = name === 'agent'  ? '' : 'none';
     document.getElementById('tracesPanel').style.display = name === 'traces' ? '' : 'none';
+  } else {
+    // Desktop: toggle split view
+    document.querySelector('.main').classList.toggle('split', name === 'traces');
   }
 }
 
@@ -854,11 +860,10 @@ async function selectProvider(provider, model) {
 
   connectSpanSSE();
   loadProviders();
-  // Restore both panels when resizing to desktop
+  // On resize to desktop: restore agent panel if it was hidden by mobile tab switch
   window.addEventListener('resize', () => {
     if (window.innerWidth > 700) {
-      document.getElementById('agentPanel').style.display  = '';
-      document.getElementById('tracesPanel').style.display = '';
+      document.getElementById('agentPanel').style.display = '';
     }
   });
   await createSession().catch(e =>
