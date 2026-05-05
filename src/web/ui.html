@@ -12,6 +12,7 @@
   --text:#e6edf3; --muted:#7d8590; --accent:#7c3aed; --accent2:#58a6ff;
   --think:#a78bfa; --act:#f59e0b; --observe:#34d399; --tool:#fb923c;
   --session:#60a5fa; --iter:#c084fc; --ok:#3fb950; --err:#f85149;
+  --observer:#f472b6; --psychologist:#34d399;
   font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 }
 html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;overflow:hidden}
@@ -115,13 +116,29 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-size:13px;over
   font-size:10px;padding:2px 7px;border-radius:99px;flex-shrink:0;
   font-weight:600;align-self:center;
 }
-.badge-think  {background:#1e1b4b;color:var(--think);border:1px solid #312e81}
-.badge-act    {background:#1c1407;color:var(--act);border:1px solid #78350f}
-.badge-tool   {background:#1c0e04;color:var(--tool);border:1px solid #7c2d12}
-.badge-observe{background:#022c22;color:var(--observe);border:1px solid #064e3b}
-.badge-ok     {background:#0a1f0a;color:var(--ok);border:1px solid #14532d}
-.badge-err    {background:#1c0a0a;color:var(--err);border:1px solid #7f1d1d}
-.badge-iter   {background:#1a0533;color:var(--iter);border:1px solid #4c1d95}
+.badge-think    {background:#1e1b4b;color:var(--think);border:1px solid #312e81}
+.badge-act      {background:#1c1407;color:var(--act);border:1px solid #78350f}
+.badge-tool     {background:#1c0e04;color:var(--tool);border:1px solid #7c2d12}
+.badge-observe  {background:#022c22;color:var(--observe);border:1px solid #064e3b}
+.badge-ok       {background:#0a1f0a;color:var(--ok);border:1px solid #14532d}
+.badge-err      {background:#1c0a0a;color:var(--err);border:1px solid #7f1d1d}
+.badge-iter     {background:#1a0533;color:var(--iter);border:1px solid #4c1d95}
+.badge-observer {background:#2d0a1f;color:var(--observer);border:1px solid #831843}
+.badge-psych    {background:#022c22;color:var(--psychologist);border:1px solid #064e3b}
+
+/* Observer / psychologist mode banner */
+.mode-banner{
+  margin:0 12px 6px;padding:8px 12px;border-radius:6px;
+  font-size:11px;font-weight:600;display:flex;align-items:center;gap:8px;
+  animation:fadeIn .3s ease;
+}
+.mode-banner.observer{background:#2d0a1f;border:1px solid #831843;color:var(--observer)}
+.mode-banner.psychologist{background:#022c22;border:1px solid #064e3b;color:var(--psychologist)}
+.mode-banner.calm{background:#0a1f1a;border:1px solid #065f46;color:#6ee7b7}
+.mode-icon{font-size:14px}
+
+/* Psychologist mode — bot messages get a teal left border */
+.msg.bot.psych-mode{border-left:3px solid var(--psychologist)}
 .pulse::after{content:'…';animation:pulse 1s steps(3,end) infinite}
 @keyframes pulse{0%{content:''}33%{content:'.'}66%{content:'..'}100%{content:'...'}}
 
@@ -356,8 +373,9 @@ async function sendMessage() {
 
   addMsg('user', text);
   openLoopPanel();
-  document.getElementById('loopBody').innerHTML = '';
+  document.getElementById('loopBody').textContent = '';
   document.getElementById('loopBadge').textContent = 'running';
+  psychMode = false;
 
   abortCtrl = new AbortController();
 
@@ -414,6 +432,8 @@ async function cancel() {
 // ═══════════════════════════════════════════════════════════════
 // Agent event rendering
 // ═══════════════════════════════════════════════════════════════
+let psychMode = false; // track if we're in psychologist mode
+
 function handleAgentEvent(ev) {
   switch (ev.type) {
     case 'iteration_start':
@@ -437,7 +457,7 @@ function handleAgentEvent(ev) {
     }
 
     case 'act_start':
-      addStep('act', `⚡ Calling ${ev.num_tools} tool${ev.num_tools!==1?'s':''}`, '', 'badge-act');
+      addStep('act', `⚡ Calling ${ev.num_tools} tool${ev.num_tools!==1?'s':''} ${ev.num_tools>1?'in parallel':''}`.trim(), '', 'badge-act');
       break;
 
     case 'tool_call_start':
@@ -463,8 +483,42 @@ function handleAgentEvent(ev) {
       break;
 
     case 'final_answer':
-      addMsg('bot', ev.content);
+      addMsg('bot', ev.content, ev.mode === 'psychologist');
       closeLoopPanel();
+      break;
+
+    // ── Observer agent events ─────────────────────────────────────────────
+    case 'observer_start':
+      addStep('observer', `👁 Observer: ${ev.agent}`, 'Analysing user sentiment…', 'badge-observer pulse', 'observer-step');
+      break;
+
+    case 'observer_done': {
+      const el = document.getElementById('observer-step');
+      if (el) {
+        el.querySelector('.step-badge').classList.remove('pulse');
+        const pct = Math.round((ev.confidence ?? 0) * 100);
+        el.querySelector('.step-sub').textContent = `sentiment: ${ev.sentiment} (${pct}%)`;
+      }
+      break;
+    }
+
+    case 'observer_interrupt':
+      addLoopBanner('observer', `⚠ Observer: ${ev.reason} — ${ev.action}`);
+      break;
+
+    case 'observer_calm':
+      addLoopBanner('calm', `✓ Observer: ${ev.message}`);
+      psychMode = false;
+      break;
+
+    case 'mode_switch':
+      if (ev.to === 'psychologist') {
+        psychMode = true;
+        addLoopBanner('psychologist', '💚 Psychologist agent active — support mode');
+      } else {
+        psychMode = false;
+        addLoopBanner('calm', '🔬 Returning to research mode');
+      }
       break;
 
     case 'cancelled':
@@ -480,7 +534,7 @@ function handleAgentEvent(ev) {
 // ═══════════════════════════════════════════════════════════════
 // UI helpers — history
 // ═══════════════════════════════════════════════════════════════
-function addMsg(type, text) {
+function addMsg(type, text, isPsych = false) {
   const $h = document.getElementById('history');
   const el = document.createElement('div');
   if (type === 'sys') {
@@ -493,11 +547,21 @@ function addMsg(type, text) {
     el.className = 'msg user';
     el.innerHTML = `<div class="msg-label">You</div>${esc(text)}`;
   } else {
-    el.className = 'msg bot';
-    el.innerHTML = `<div class="msg-label">Assistant</div>${marked.parse(text)}`;
+    el.className = 'msg bot' + (isPsych ? ' psych-mode' : '');
+    const label = isPsych ? 'Support Agent' : 'Assistant';
+    el.innerHTML = `<div class="msg-label">${label}</div>${marked.parse(text)}`;
   }
   $h.appendChild(el);
   $h.scrollTop = $h.scrollHeight;
+}
+
+function addLoopBanner(variant, text) {
+  const $b = document.getElementById('loopBody');
+  const el = document.createElement('div');
+  el.className = `mode-banner ${variant}`;
+  el.innerHTML = `<span class="mode-icon">${variant === 'psychologist' ? '💚' : variant === 'calm' ? '✓' : '⚠'}</span>${esc(text)}`;
+  $b.appendChild(el);
+  $b.scrollTop = $b.scrollHeight;
 }
 
 // ═══════════════════════════════════════════════════════════════

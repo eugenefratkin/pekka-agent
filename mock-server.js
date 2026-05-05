@@ -227,13 +227,13 @@ function jitter(base, spread = 0.3) {
  * Returns { content, citations } on success, or throws on error.
  * Falls back to null if no API key is set (caller uses mock response).
  */
-async function callPerplexity(query) {
+async function callPerplexity(query, systemPrompt = 'Be precise and concise.') {
   if (!PERPLEXITY_KEY) return null;
 
   const body = JSON.stringify({
     model: PERPLEXITY_MODEL,
     messages: [
-      { role: 'system', content: 'Be precise and concise.' },
+      { role: 'system', content: systemPrompt },
       { role: 'user',   content: query },
     ],
   });
@@ -256,6 +256,96 @@ async function callPerplexity(query) {
   const content   = data.choices?.[0]?.message?.content ?? '<empty>';
   const citations = data.citations ?? [];
   return { content, citations };
+}
+
+// ─── Query decomposition ──────────────────────────────────────────────────────
+
+/** Break a question into 2-3 parallel sub-queries based on type. */
+function decomposeQuery(message) {
+  const lower = message.toLowerCase();
+  if (/\bvs\b|versus|compar|difference|tradeoff|pros.*con|better.*than|which.*should/.test(lower)) {
+    return [
+      `${message} — key advantages and strengths`,
+      `${message} — disadvantages and limitations`,
+      `${message} — practical recommendations`,
+    ];
+  }
+  if (/\bhow\b.*\bwork|\bexplain\b|\bwhat is\b|\bwhat are\b|\barchitecture\b|\bhow do\b/.test(lower)) {
+    return [
+      `${message} — overview and core concepts`,
+      `${message} — practical examples and use cases`,
+      `${message} — best practices and pitfalls`,
+    ];
+  }
+  if (/\bfuture\b|\btrend\b|\b2024\b|\b2025\b|\blatest\b|\bnew\b|\brecent\b/.test(lower)) {
+    return [
+      `${message} — current state`,
+      `${message} — recent developments and trends`,
+    ];
+  }
+  // Always do at least 2 parallel searches to demonstrate parallelism
+  return [
+    message,
+    `${message} — related context and background`,
+  ];
+}
+
+// ─── Sentiment detection ──────────────────────────────────────────────────────
+
+const ANGER_SIGNALS = [
+  [/\b(stupid|idiot|useless|terrible|awful|hate\b|sucks|wtf|dumb|worst|ridiculous|pathetic|trash|garbage)\b/i, 2],
+  [/\b(fuck|shit|crap|damn)\b/i, 2],
+  [/[A-Z]{6,}/, 1],
+  [/!{2,}/, 1],
+  [/\b(not working|doesn.t work|broken|failed|nothing works|waste of time)\b/i, 1],
+  [/\b(frustrated|annoyed|angry|pissed|upset)\b/i, 1],
+];
+
+function detectSentiment(message) {
+  let score = 0;
+  for (const [pattern, weight] of ANGER_SIGNALS) {
+    if (pattern.test(message)) score += weight;
+  }
+  if (score >= 2) return { sentiment: 'angry',      confidence: Math.min(0.55 + score * 0.1, 0.97) };
+  if (score >= 1) return { sentiment: 'frustrated', confidence: 0.72 };
+  return              { sentiment: 'neutral',    confidence: 0.95 };
+}
+
+function getSupportResponse(sentiment, message) {
+  const pool = {
+    angry: [
+      `I can hear that you're really frustrated right now, and that's completely valid. These situations can feel incredibly draining.\n\nLet's slow down together. You don't have to figure everything out at once — I'm here to help however I can.\n\nWhat's weighing on you most right now?`,
+      `Your frustration makes total sense — I'd feel the same in your position. Sometimes when things aren't working, the irritation just builds up.\n\nI want to actually help, not just pile on more things to try. Can you tell me what you were hoping to accomplish? Starting from what you really need often reveals a clearer path forward.`,
+    ],
+    frustrated: [
+      `I can tell this has been challenging, and it's okay to feel frustrated. Being stuck is genuinely tough.\n\nWould it help to step back and look at the bigger picture together? Sometimes a fresh angle reveals options we hadn't thought of.\n\nWhat's your main concern right now — what would feel like a real win?`,
+      `Feeling stuck is hard, and it's okay to acknowledge that. You're dealing with something that isn't easy.\n\nI'm here — let's work through this together. What part feels most overwhelming right now?`,
+    ],
+  };
+  const arr = pool[sentiment] || pool.frustrated;
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// ─── Session state ────────────────────────────────────────────────────────────
+
+/** Tracks which sessions are in psychologist mode and how many turns since switch. */
+const calmingState = new Map(); // sessionId → { mode: 'psychologist'|'research', turns: number }
+
+/**
+ * Conversation history per session — sent to Perplexity as context so it knows
+ * what has already been discussed. Capped at 10 turns to stay within token limits.
+ */
+const conversationHistory = new Map(); // sessionId → [{ role, content }]
+
+function getHistory(sessionId) {
+  return conversationHistory.get(sessionId) ?? [];
+}
+
+function appendHistory(sessionId, role, content) {
+  const hist = getHistory(sessionId);
+  hist.push({ role, content: content.slice(0, 1200) }); // cap per-turn length
+  if (hist.length > 20) hist.splice(0, hist.length - 20); // keep last 10 turns (20 messages)
+  conversationHistory.set(sessionId, hist);
 }
 
 // ─── SSE helpers ──────────────────────────────────────────────────────────────
@@ -358,23 +448,39 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
     const iterTools = i < toolCalls.length ? toolCalls[i] : [];
     if (iterTools.length) {
       const actSid   = spanId();
-      const actMs    = iterTools.reduce((s, t) => s + t.durationMs, 0) + 20;
+      const isParallelAct0 = iterTools.some(t => t.parallel);
+      const actMs    = isParallelAct0
+        ? Math.max(...iterTools.map(t => t.durationMs)) + 20
+        : iterTools.reduce((s, t) => s + t.durationMs, 0) + 20;
       const actStart = iterStart + actOffset;
       spans.push(makeSpan('react.act', tid, actSid, iterSid, actStart, actMs, {
         'react.iteration':       i,
         'react.tool_call_count': iterTools.length,
       }));
 
-      let toolOffset = 5;
-      for (const tc of iterTools) {
-        const toolSid   = spanId();
-        const toolStart = actStart + toolOffset;
-        spans.push(makeSpan('tool.call', tid, toolSid, actSid, toolStart, tc.durationMs, {
-          'tool.name':    tc.name,
-          'tool.call_id': tc.callId,
-          'tool.success': true,
-        }));
-        toolOffset += tc.durationMs + 5;
+      if (isParallelAct0) {
+        // All tools start nearly simultaneously — shows parallelism in waterfall
+        for (const tc of iterTools) {
+          const toolSid   = spanId();
+          const toolStart = actStart + 5 + (tc.startOffset || 0);
+          spans.push(makeSpan('tool.call', tid, toolSid, actSid, toolStart, tc.durationMs, {
+            'tool.name':    tc.name,
+            'tool.call_id': tc.callId,
+            'tool.success': true,
+          }));
+        }
+      } else {
+        let toolOffset = 5;
+        for (const tc of iterTools) {
+          const toolSid   = spanId();
+          const toolStart = actStart + toolOffset;
+          spans.push(makeSpan('tool.call', tid, toolSid, actSid, toolStart, tc.durationMs, {
+            'tool.name':    tc.name,
+            'tool.call_id': tc.callId,
+            'tool.success': true,
+          }));
+          toolOffset += tc.durationMs + 5;
+        }
       }
 
       actOffset += actMs + 10;
@@ -398,41 +504,66 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
   }
 }
 
-// ─── Universal scenario: every message goes to Perplexity ────────────────────
+// ─── Parallel research scenario ───────────────────────────────────────────────
 
 async function streamScenario(res, message, sessionId, model) {
-  const callId    = randHex(4);
-  const reasoning = `I'll use Perplexity to research: "${message}"`;
+  const subQueries = decomposeQuery(message);
+  const reasoning  = subQueries.length > 1
+    ? `I'll research this with ${subQueries.length} parallel searches simultaneously`
+    : `I'll use Perplexity to research: "${message}"`;
 
-  // ── Iteration 0: think → search ──────────────────────────────────────────
+  // Build context from conversation history
+  const hist = getHistory(sessionId);
+  const histContext = hist.length
+    ? 'Prior conversation context:\n' + hist.map(h => `${h.role}: ${h.content}`).join('\n') + '\n\n'
+    : '';
+  const systemPrompt = histContext
+    ? `${histContext}Be precise and concise. Use the prior context above to give coherent follow-up answers.`
+    : 'Be precise and concise.';
+
+  // ── Iteration 0: think → parallel searches ───────────────────────────────
   agentEvent(res, { type: 'iteration_start', iteration: 0 });
   await sleep(jitter(100));
   agentEvent(res, { type: 'think_start', iteration: 0 });
   await sleep(jitter(400, 0.2));
   agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
   await sleep(80);
-  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
-  await sleep(50);
-  agentEvent(res, { type: 'tool_call_start', call_id: callId, name: 'perplexity_search',
-    args: { query: message } });
 
-  const t0 = Date.now();
-  let toolResult;
-  try {
-    const pplx = await callPerplexity(message);
-    if (pplx) {
-      toolResult = pplx.citations.length
-        ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, i) => `[${i + 1}] ${u}`).join('\n')}`
-        : pplx.content;
-    }
-  } catch (e) {
-    console.error('[perplexity]', e.message);
+  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: subQueries.length });
+  await sleep(40);
+
+  const callIds = subQueries.map(() => randHex(4));
+  // Emit all tool_call_start events nearly simultaneously
+  for (let i = 0; i < subQueries.length; i++) {
+    agentEvent(res, { type: 'tool_call_start', call_id: callIds[i],
+      name: 'perplexity_search', args: { query: subQueries[i] } });
+    if (i < subQueries.length - 1) await sleep(15);
   }
-  if (!toolResult) toolResult = `(Perplexity unavailable) No answer found for: "${message}"`;
-  const toolDuration = Date.now() - t0;
 
-  agentEvent(res, { type: 'tool_call_done', call_id: callId, name: 'perplexity_search',
-    result: toolResult, success: true });
+  // ── Run all searches in parallel ─────────────────────────────────────────
+  const t0 = Date.now();
+  const rawResults = await Promise.all(
+    subQueries.map(q => callPerplexity(q, systemPrompt).catch(e => {
+      console.error('[perplexity]', e.message); return null;
+    }))
+  );
+  const parallelDuration = Date.now() - t0;
+
+  // Emit tool_call_done for each with small stagger (they all finished, show in order)
+  const toolResults = [];
+  for (let i = 0; i < subQueries.length; i++) {
+    const pplx = rawResults[i];
+    const result = pplx
+      ? (pplx.citations?.length
+          ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
+          : pplx.content)
+      : `(Perplexity unavailable) No answer for: "${subQueries[i]}"`;
+    agentEvent(res, { type: 'tool_call_done', call_id: callIds[i],
+      name: 'perplexity_search', result, success: !!pplx });
+    toolResults.push(result);
+    await sleep(25);
+  }
+
   await sleep(60);
   agentEvent(res, { type: 'observe_done', iteration: 0 });
   await sleep(100);
@@ -442,16 +573,121 @@ async function streamScenario(res, message, sessionId, model) {
   await sleep(jitter(80));
   agentEvent(res, { type: 'think_start', iteration: 1 });
   await sleep(jitter(400, 0.3));
-  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: null });
+  const synthNote = subQueries.length > 1 ? 'Synthesising results from parallel searches…' : null;
+  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: synthNote });
   await sleep(50);
 
-  agentEvent(res, { type: 'final_answer', content: toolResult, iterations: 2 });
+  const finalAnswer = subQueries.length > 1
+    ? toolResults.map((r, i) => `### ${subQueries[i].split(' — ')[1] ?? subQueries[i]}\n\n${r}`).join('\n\n---\n\n')
+    : toolResults[0];
 
-  emitTrace(sessionId, model, 2, [
-    [{ name: 'perplexity_search', callId, durationMs: toolDuration || jitter(600) }],
-    [],
-  ], message, [reasoning, null]);
+  agentEvent(res, { type: 'final_answer', content: finalAnswer, iterations: 2 });
+
+  // Persist to history
+  appendHistory(sessionId, 'user', message);
+  appendHistory(sessionId, 'assistant', finalAnswer.slice(0, 800));
+
+  // Parallel tool spans for the OTel waterfall
+  const toolSpans = subQueries.map((_, i) => ({
+    name: 'perplexity_search',
+    callId: callIds[i],
+    durationMs: Math.round(parallelDuration * (0.8 + Math.random() * 0.4)),
+    parallel: true,
+    startOffset: i * 15,
+  }));
+
+  emitTrace(sessionId, model, 2, [toolSpans, []], message, [reasoning, synthNote]);
   res.end();
+}
+
+// ─── Psychologist scenario (triggered by sentiment observer) ──────────────────
+
+async function streamPsychologist(res, message, sessionId, model, sentiment) {
+  const pct = Math.round(sentiment.confidence * 100);
+
+  // ── Observer agent runs first ─────────────────────────────────────────────
+  agentEvent(res, { type: 'observer_start', agent: 'sentiment-monitor' });
+  await sleep(200);
+  agentEvent(res, { type: 'observer_done', agent: 'sentiment-monitor',
+    sentiment: sentiment.sentiment, confidence: sentiment.confidence });
+  await sleep(120);
+  agentEvent(res, { type: 'observer_interrupt',
+    reason: `${sentiment.sentiment} detected (${pct}% confidence)`,
+    action: 'activating support mode' });
+  await sleep(250);
+  agentEvent(res, { type: 'mode_switch', from: 'research', to: 'psychologist' });
+  await sleep(300);
+
+  // ── Iteration 0: psychologist thinks and responds ─────────────────────────
+  agentEvent(res, { type: 'iteration_start', iteration: 0 });
+  await sleep(100);
+  agentEvent(res, { type: 'think_start', iteration: 0 });
+  await sleep(jitter(500, 0.2));
+  const reasoning = `User seems ${sentiment.sentiment}. I should respond with empathy and understanding before addressing any technical content.`;
+  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
+  await sleep(80);
+
+  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
+  const callId = randHex(4);
+  agentEvent(res, { type: 'tool_call_start', call_id: callId,
+    name: 'emotional_support', args: { sentiment: sentiment.sentiment, approach: 'empathy-first' } });
+
+  const t0 = Date.now();
+  const psychSystem =
+    `You are a compassionate AI support counselor. The user seems ${sentiment.sentiment}. ` +
+    `Respond with empathy and warmth. Validate their feelings without being patronizing. ` +
+    `Keep your response to 2-3 paragraphs. Acknowledge what they said, offer understanding, ` +
+    `and end with a gentle open question that invites them to share more. ` +
+    `Do NOT lecture or give unsolicited advice.`;
+
+  let response = null;
+  try {
+    const pplx = await callPerplexity(message, psychSystem);
+    response = pplx?.content ?? null;
+  } catch (e) {
+    console.error('[psychologist]', e.message);
+  }
+  if (!response) response = getSupportResponse(sentiment.sentiment, message);
+  const toolDuration = Date.now() - t0;
+
+  agentEvent(res, { type: 'tool_call_done', call_id: callId,
+    name: 'emotional_support', result: response, success: true });
+  await sleep(60);
+  agentEvent(res, { type: 'observe_done', iteration: 0 });
+  await sleep(100);
+
+  agentEvent(res, { type: 'iteration_start', iteration: 1 });
+  await sleep(80);
+  agentEvent(res, { type: 'think_start', iteration: 1 });
+  await sleep(jitter(300, 0.2));
+  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: 'Formulating empathetic response…' });
+  await sleep(50);
+
+  agentEvent(res, { type: 'final_answer', content: response, iterations: 2, mode: 'psychologist' });
+
+  // Persist to history
+  appendHistory(sessionId, 'user', message);
+  appendHistory(sessionId, 'assistant', response.slice(0, 800));
+
+  emitTrace(sessionId, model, 2,
+    [[{ name: 'emotional_support', callId, durationMs: toolDuration || jitter(400) }], []],
+    message, [reasoning, 'Formulating empathetic response…']);
+  res.end();
+}
+
+// ─── Calm-transition scenario: user calmed down, switch back to research ──────
+
+async function streamCalmTransition(res, message, sessionId, model) {
+  agentEvent(res, { type: 'observer_start', agent: 'sentiment-monitor' });
+  await sleep(200);
+  agentEvent(res, { type: 'observer_done', agent: 'sentiment-monitor',
+    sentiment: 'neutral', confidence: 0.9 });
+  await sleep(120);
+  agentEvent(res, { type: 'observer_calm', message: 'User sentiment has stabilised — returning to research mode' });
+  await sleep(300);
+  agentEvent(res, { type: 'mode_switch', from: 'psychologist', to: 'research' });
+  await sleep(200);
+  await streamScenario(res, message, sessionId, model);
 }
 
 // ─── Request router ───────────────────────────────────────────────────────────
@@ -609,7 +845,20 @@ const server = http.createServer(async (req, res) => {
 
     sseHeaders(res);
     try {
-      await streamScenario(res, message, sessionId, MODEL);
+      const sentiment = detectSentiment(message);
+      const state = calmingState.get(sessionId) ?? { mode: 'research', turns: 0 };
+
+      if (sentiment.sentiment !== 'neutral') {
+        // Angry/frustrated → psychologist takes over
+        calmingState.set(sessionId, { mode: 'psychologist', turns: 0 });
+        await streamPsychologist(res, message, sessionId, MODEL, sentiment);
+      } else if (state.mode === 'psychologist') {
+        // Was in psychologist mode, user now seems calm → transition back
+        calmingState.set(sessionId, { mode: 'research', turns: 0 });
+        await streamCalmTransition(res, message, sessionId, MODEL);
+      } else {
+        await streamScenario(res, message, sessionId, MODEL);
+      }
     } catch (e) {
       agentEvent(res, { type: 'error', message: e.message });
       res.end();
@@ -653,10 +902,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n  pekka-llm mock server\n`);
   console.log(`  ➜  http://localhost:${PORT}\n`);
-  console.log(`  Try asking about: math, weather, or any search query\n`);
+  console.log(`  Features:`);
+  console.log(`    • Parallel Perplexity searches (2-3 sub-queries simultaneously)`);
+  console.log(`    • Sentiment observer agent (anger → psychologist mode)`);
+  console.log(`    • Session conversation history (Perplexity sees prior context)`);
   if (process.env.PERPLEXITY_API_KEY) {
-    console.log(`  Perplexity search: ENABLED (model: ${PERPLEXITY_MODEL})\n`);
+    console.log(`\n  Perplexity: ENABLED (model: ${PERPLEXITY_MODEL})`);
   } else {
-    console.log(`  Perplexity search: DISABLED (set PERPLEXITY_API_KEY to enable)\n`);
+    console.log(`\n  Perplexity: DISABLED (set PERPLEXITY_API_KEY to enable)`);
   }
+  console.log();
 });
