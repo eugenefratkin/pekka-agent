@@ -30,6 +30,9 @@ const UI_HTML           = path.join(__dirname, 'src', 'web', 'ui.html');
 const PERPLEXITY_KEY    = process.env.PERPLEXITY_API_KEY ?? '';
 const PERPLEXITY_MODEL  = 'sonar';
 const PERPLEXITY_URL    = 'https://api.perplexity.ai/chat/completions';
+const OPENAI_KEY        = process.env.OPENAI_API_KEY ?? '';
+const OPENAI_MODEL      = process.env.OPENAI_MODEL ?? 'gpt-4o';
+const OPENAI_URL        = 'https://api.openai.com/v1/chat/completions';
 
 // ─── Auth config ──────────────────────────────────────────────────────────────
 
@@ -256,6 +259,31 @@ async function callPerplexity(query, systemPrompt = 'Be precise and concise.') {
   const content   = data.choices?.[0]?.message?.content ?? '<empty>';
   const citations = data.citations ?? [];
   return { content, citations };
+}
+
+/**
+ * Call OpenAI chat completions for reasoning steps (planning, synthesis).
+ * Returns the assistant message content, or throws on error.
+ */
+async function callOpenAI(messages) {
+  if (!OPENAI_KEY) return null;
+
+  const res = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_KEY}`,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(`OpenAI ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? null;
 }
 
 // ─── Query decomposition ──────────────────────────────────────────────────────
@@ -587,26 +615,26 @@ async function streamScenario(res, message, sessionId, model) {
     name: 'plan_followup', args: { based_on: 'discovery results' } });
 
   let followUpQueries = [];
-  if (PERPLEXITY_KEY) {
-    try {
-      const planPrompt =
-        `Original question: "${message}"\n\n` +
-        `Discovery results:\n${discoveryResult.slice(0, 2000)}\n\n` +
-        `Based on these results, identify specific entities (companies, people, topics, products) ` +
-        `from the discovery that should each be researched individually in more depth. ` +
-        `Output ONLY a JSON array of focused search query strings (2-5 queries). ` +
-        `If the discovery already fully answers the question output []. ` +
-        `No explanation, no markdown fences — just the array.`;
-      const planRes = await callPerplexity(planPrompt, 'You are a research planner. Output only a JSON array of strings.');
-      if (planRes?.content) {
-        const match = planRes.content.match(/\[[\s\S]*?\]/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (Array.isArray(parsed)) followUpQueries = parsed.slice(0, 5).map(String).filter(Boolean);
-        }
+  try {
+    const planContent = await callOpenAI([
+      { role: 'system', content:
+          'You are a research planner. Given an original question and discovery results, ' +
+          'identify specific entities (companies, people, topics, products) that each need ' +
+          'individual deeper research. Output ONLY a JSON array of focused search query ' +
+          'strings (2-5 items). If the discovery already fully answers the question output []. ' +
+          'No explanation, no markdown fences — just the array.' },
+      { role: 'user', content:
+          `Original question: "${message}"\n\nDiscovery results:\n${discoveryResult.slice(0, 3000)}` },
+    ]);
+    if (planContent) {
+      const match = planContent.match(/\[[\s\S]*?\]/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        if (Array.isArray(parsed)) followUpQueries = parsed.slice(0, 5).map(String).filter(Boolean);
       }
-    } catch (e) { console.error('[plan-followup]', e.message); }
-  }
+    }
+  } catch (e) { console.error('[plan-followup openai]', e.message); }
+
   if (!followUpQueries.length) followUpQueries = decomposeQuery(message);
 
   const planResult = `Follow-up plan (${followUpQueries.length} parallel searches):\n` +
@@ -677,21 +705,19 @@ async function streamScenario(res, message, sessionId, model) {
     name: 'synthesize', args: { sources: 1 + deepResults.length } });
 
   let finalAnswer = null;
-  if (PERPLEXITY_KEY) {
-    try {
-      const synthUser =
-        `Question: "${message}"\n\n## Discovery\n${discoveryResult}\n\n` +
-        followUpQueries.map((q, i) => `## Deep-dive: ${q}\n${deepResults[i]}`).join('\n\n') +
-        `\n\nWrite a single, well-structured answer synthesising all the above. ` +
-        `Be comprehensive yet concise. Use markdown. Integrate information naturally — ` +
-        `do not reference "Discovery" or "Deep-dive" sections explicitly.`;
-      const synthSystem = (histContext || '') +
-        `You are a helpful research assistant. Synthesise multiple research results into one clear, ` +
-        `coherent answer. Do not say "according to source 1/2/3".`;
-      const synthRes = await callPerplexity(synthUser, synthSystem);
-      finalAnswer = synthRes?.content ?? null;
-    } catch (e) { console.error('[synthesize]', e.message); }
-  }
+  try {
+    finalAnswer = await callOpenAI([
+      { role: 'system', content:
+          (histContext || '') +
+          'You are a helpful research assistant. Synthesise the provided research results into ' +
+          'one clear, well-structured answer. Use markdown. Integrate information naturally — ' +
+          'do not say "according to source 1/2/3" or reference section names explicitly.' },
+      { role: 'user', content:
+          `Question: "${message}"\n\n## Discovery\n${discoveryResult}\n\n` +
+          followUpQueries.map((q, i) => `## Deep-dive: ${q}\n${deepResults[i]}`).join('\n\n') +
+          '\n\nWrite a single comprehensive answer.' },
+    ]);
+  } catch (e) { console.error('[synthesize openai]', e.message); }
   if (!finalAnswer) {
     finalAnswer = `## Overview\n\n${discoveryResult}\n\n---\n\n` +
       followUpQueries.map((q, i) => `### ${q}\n\n${deepResults[i]}`).join('\n\n---\n\n');
@@ -843,7 +869,7 @@ function json(res, status, body) {
   res.end(payload);
 }
 
-const MODEL = 'gpt-4o-mini (mock)';
+const MODEL = OPENAI_KEY ? OPENAI_MODEL : 'gpt-4o (mock)';
 
 const server = http.createServer(async (req, res) => {
   const { method } = req;
@@ -1039,10 +1065,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`    • Parallel Perplexity searches (2-3 sub-queries simultaneously)`);
   console.log(`    • Sentiment observer agent (anger → psychologist mode)`);
   console.log(`    • Session conversation history (Perplexity sees prior context)`);
-  if (process.env.PERPLEXITY_API_KEY) {
-    console.log(`\n  Perplexity: ENABLED (model: ${PERPLEXITY_MODEL})`);
-  } else {
-    console.log(`\n  Perplexity: DISABLED (set PERPLEXITY_API_KEY to enable)`);
-  }
+  console.log(`\n  Reasoning:  ${OPENAI_KEY   ? `OpenAI ${OPENAI_MODEL}` : 'DISABLED (set OPENAI_API_KEY)'}`);
+  console.log(`  Retrieval:  ${PERPLEXITY_KEY ? `Perplexity ${PERPLEXITY_MODEL}` : 'DISABLED (set PERPLEXITY_API_KEY)'}`);
   console.log();
 });
