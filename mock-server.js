@@ -398,215 +398,60 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
   }
 }
 
-// ─── Demo scenarios ───────────────────────────────────────────────────────────
-
-function pickScenario(message) {
-  const m = message.toLowerCase();
-  if (/\d[\d\s]*[+\-*/][\d\s]*\d|calculat|math|comput|add|subtract|multiply|divid/.test(m))
-    return 'calculator';
-  if (/weather|temperatur|forecast|rain/.test(m))
-    return 'weather';
-  // Everything else goes to Perplexity — it handles factual questions,
-  // comparisons, tradeoffs, how-tos, current events, etc. far better than
-  // a canned response.
-  return 'search';
-}
-
-// Evaluate simple arithmetic safely
-function evalMath(expr) {
-  try {
-    // Only allow digits, spaces, operators, parens, dots
-    if (!/^[\d\s+\-*/.()%]+$/.test(expr)) return null;
-    // eslint-disable-next-line no-new-func
-    const result = Function('"use strict"; return (' + expr + ')')();
-    return typeof result === 'number' ? String(result) : null;
-  } catch { return null; }
-}
-
-function extractExpression(message) {
-  const m = message.match(/[\d][\d\s+\-*/.()%]*/);
-  return m ? m[0].trim() : '2 + 2';
-}
+// ─── Universal scenario: every message goes to Perplexity ────────────────────
 
 async function streamScenario(res, message, sessionId, model) {
-  const scenario = pickScenario(message);
+  const callId    = randHex(4);
+  const reasoning = `I'll use Perplexity to research: "${message}"`;
 
-  if (scenario === 'direct') {
-    // ── 1 iteration, no tools ──
-    agentEvent(res, { type: 'iteration_start', iteration: 0 });
-    await sleep(jitter(120));
-    agentEvent(res, { type: 'think_start', iteration: 0 });
-    await sleep(jitter(1100, 0.4));
-    agentEvent(res, { type: 'think_done', iteration: 0, partial_text: null });
-    await sleep(50);
+  // ── Iteration 0: think → search ──────────────────────────────────────────
+  agentEvent(res, { type: 'iteration_start', iteration: 0 });
+  await sleep(jitter(100));
+  agentEvent(res, { type: 'think_start', iteration: 0 });
+  await sleep(jitter(400, 0.2));
+  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
+  await sleep(80);
+  agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
+  await sleep(50);
+  agentEvent(res, { type: 'tool_call_start', call_id: callId, name: 'perplexity_search',
+    args: { query: message } });
 
-    const answers = [
-      `That's an interesting question. Based on my knowledge, I'd say: ${message.endsWith('?') ? message.replace(/\?$/, '') + '.' : 'it depends on the context.'} Would you like me to dig deeper into any particular aspect?`,
-      `Great question! Here's my take: the key insight is that every system has trade-offs. For your specific case — "${message}" — I'd recommend starting simple and iterating based on feedback.`,
-      `I've thought about this carefully. The short answer is: yes, with caveats. The long answer involves understanding the constraints, the goals, and the available options. Happy to elaborate on any of those.`,
-    ];
-    const answer = answers[Math.floor(Math.random() * answers.length)];
-
-    agentEvent(res, { type: 'final_answer', content: answer, iterations: 1 });
-    emitTrace(sessionId, model, 1, [[]], message, [null]);
-    res.end();
-    return;
-  }
-
-  if (scenario === 'calculator') {
-    // ── 2 iterations: think → call calculator → think → answer ──
-    const expr   = extractExpression(message);
-    const result = evalMath(expr) ?? '42';
-    const callId = randHex(4);
-
-    agentEvent(res, { type: 'iteration_start', iteration: 0 });
-    await sleep(jitter(100));
-    agentEvent(res, { type: 'think_start', iteration: 0 });
-    await sleep(jitter(700, 0.3));
-    agentEvent(res, { type: 'think_done', iteration: 0, partial_text: 'I should use the calculator tool for this.' });
-    await sleep(80);
-    agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
-    await sleep(50);
-    agentEvent(res, { type: 'tool_call_start', call_id: callId, name: 'calculator',
-      args: { expression: expr } });
-    await sleep(jitter(400, 0.4));
-    agentEvent(res, { type: 'tool_call_done', call_id: callId, name: 'calculator',
-      result, success: true });
-    await sleep(60);
-    agentEvent(res, { type: 'observe_done', iteration: 0 });
-    await sleep(100);
-
-    agentEvent(res, { type: 'iteration_start', iteration: 1 });
-    await sleep(jitter(80));
-    agentEvent(res, { type: 'think_start', iteration: 1 });
-    await sleep(jitter(600, 0.3));
-    agentEvent(res, { type: 'think_done', iteration: 1, partial_text: null });
-    await sleep(50);
-
-    const answer = `The result of \`${expr}\` is **${result}**.`;
-    agentEvent(res, { type: 'final_answer', content: answer, iterations: 2 });
-
-    emitTrace(sessionId, model, 2, [
-      [{ name: 'calculator', callId, durationMs: jitter(380) }],
-      [],
-    ], message, ['I should use the calculator tool for this.', null]);
-    res.end();
-    return;
-  }
-
-  if (scenario === 'weather') {
-    const callId = randHex(4);
-    const city   = message.match(/in ([A-Za-z\s]+)/i)?.[1]?.trim() ?? 'San Francisco';
-    const reasoning = `I'll search Perplexity for the current weather in ${city}.`;
-
-    agentEvent(res, { type: 'iteration_start', iteration: 0 });
-    await sleep(jitter(100));
-    agentEvent(res, { type: 'think_start', iteration: 0 });
-    agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
-    await sleep(80);
-    agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
-    await sleep(50);
-    agentEvent(res, { type: 'tool_call_start', call_id: callId, name: 'perplexity_search',
-      args: { query: `current weather in ${city}` } });
-
-    const t0 = Date.now();
-    let toolResult;
-    try {
-      const pplx = await callPerplexity(`What is the current weather in ${city}?`);
-      if (pplx) {
-        toolResult = pplx.citations.length
-          ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u,i)=>`[${i+1}] ${u}`).join('\n')}`
-          : pplx.content;
-      }
-    } catch (e) {
-      console.error('[perplexity]', e.message);
+  const t0 = Date.now();
+  let toolResult;
+  try {
+    const pplx = await callPerplexity(message);
+    if (pplx) {
+      toolResult = pplx.citations.length
+        ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, i) => `[${i + 1}] ${u}`).join('\n')}`
+        : pplx.content;
     }
-    if (!toolResult) {
-      const conditions = ['Sunny, 72°F', 'Partly cloudy, 65°F', 'Overcast, 58°F', 'Clear, 78°F'];
-      toolResult = `{"city":"${city}","conditions":"${conditions[Math.floor(Math.random() * conditions.length)]}"}`;
-    }
-    const toolDuration = Date.now() - t0;
-
-    agentEvent(res, { type: 'tool_call_done', call_id: callId, name: 'perplexity_search',
-      result: toolResult, success: true });
-    await sleep(60);
-    agentEvent(res, { type: 'observe_done', iteration: 0 });
-    await sleep(100);
-
-    agentEvent(res, { type: 'iteration_start', iteration: 1 });
-    await sleep(jitter(80));
-    agentEvent(res, { type: 'think_start', iteration: 1 });
-    await sleep(jitter(500, 0.3));
-    agentEvent(res, { type: 'think_done', iteration: 1, partial_text: null });
-    await sleep(50);
-
-    const answer = toolResult.startsWith('{')
-      ? `The current weather in **${city}** is: ${JSON.parse(toolResult).conditions}.`
-      : toolResult;
-    agentEvent(res, { type: 'final_answer', content: answer, iterations: 2 });
-
-    emitTrace(sessionId, model, 2, [
-      [{ name: 'perplexity_search', callId, durationMs: toolDuration || jitter(520) }],
-      [],
-    ], message, [reasoning, null]);
-    res.end();
-    return;
+  } catch (e) {
+    console.error('[perplexity]', e.message);
   }
+  if (!toolResult) toolResult = `(Perplexity unavailable) No answer found for: "${message}"`;
+  const toolDuration = Date.now() - t0;
 
-  if (scenario === 'search') {
-    const callId = randHex(4);
-    const query  = message.replace(/^(search|find|look up|who is|what is)\s*/i, '').replace(/\?$/, '');
-    const reasoning = `I should use Perplexity to search for "${query}".`;
+  agentEvent(res, { type: 'tool_call_done', call_id: callId, name: 'perplexity_search',
+    result: toolResult, success: true });
+  await sleep(60);
+  agentEvent(res, { type: 'observe_done', iteration: 0 });
+  await sleep(100);
 
-    agentEvent(res, { type: 'iteration_start', iteration: 0 });
-    await sleep(jitter(100));
-    agentEvent(res, { type: 'think_start', iteration: 0 });
-    await sleep(jitter(400, 0.2));
-    agentEvent(res, { type: 'think_done', iteration: 0, partial_text: reasoning });
-    await sleep(80);
-    agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
-    await sleep(50);
-    agentEvent(res, { type: 'tool_call_start', call_id: callId, name: 'perplexity_search',
-      args: { query } });
+  // ── Iteration 1: synthesise ───────────────────────────────────────────────
+  agentEvent(res, { type: 'iteration_start', iteration: 1 });
+  await sleep(jitter(80));
+  agentEvent(res, { type: 'think_start', iteration: 1 });
+  await sleep(jitter(400, 0.3));
+  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: null });
+  await sleep(50);
 
-    const t0 = Date.now();
-    let toolResult;
-    try {
-      const pplx = await callPerplexity(query);
-      if (pplx) {
-        toolResult = pplx.citations.length
-          ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u,i)=>`[${i+1}] ${u}`).join('\n')}`
-          : pplx.content;
-      }
-    } catch (e) {
-      console.error('[perplexity]', e.message);
-    }
-    if (!toolResult) {
-      toolResult = `Top results for "${query}": [1] Wikipedia article... [2] Official docs... [3] Recent news...`;
-    }
-    const toolDuration = Date.now() - t0;
+  agentEvent(res, { type: 'final_answer', content: toolResult, iterations: 2 });
 
-    agentEvent(res, { type: 'tool_call_done', call_id: callId, name: 'perplexity_search',
-      result: toolResult, success: true });
-    await sleep(60);
-    agentEvent(res, { type: 'observe_done', iteration: 0 });
-    await sleep(100);
-
-    agentEvent(res, { type: 'iteration_start', iteration: 1 });
-    await sleep(jitter(80));
-    agentEvent(res, { type: 'think_start', iteration: 1 });
-    await sleep(jitter(500, 0.3));
-    agentEvent(res, { type: 'think_done', iteration: 1, partial_text: null });
-    await sleep(50);
-
-    agentEvent(res, { type: 'final_answer', content: toolResult, iterations: 2 });
-
-    emitTrace(sessionId, model, 2, [
-      [{ name: 'perplexity_search', callId, durationMs: toolDuration || jitter(600) }],
-      [],
-    ], message, [reasoning, null]);
-    res.end();
-  }
+  emitTrace(sessionId, model, 2, [
+    [{ name: 'perplexity_search', callId, durationMs: toolDuration || jitter(600) }],
+    [],
+  ], message, [reasoning, null]);
+  res.end();
 }
 
 // ─── Request router ───────────────────────────────────────────────────────────
