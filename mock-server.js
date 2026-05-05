@@ -406,9 +406,10 @@ function pickScenario(message) {
     return 'calculator';
   if (/weather|temperatur|forecast|rain/.test(m))
     return 'weather';
-  if (/search|find|look\s*up|who is|what is/.test(m))
-    return 'search';
-  return 'direct';
+  // Everything else goes to Perplexity — it handles factual questions,
+  // comparisons, tradeoffs, how-tos, current events, etc. far better than
+  // a canned response.
+  return 'search';
 }
 
 // Evaluate simple arithmetic safely
