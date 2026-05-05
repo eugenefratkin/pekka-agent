@@ -524,174 +524,210 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
   }
 }
 
-// ─── ReAct loop: Plan → Parallel Research → Synthesize ───────────────────────
+// ─── ReAct loop: Discover → Plan follow-up → Parallel deep-dive → Synthesize ─
+//
+// The key insight: the agent can't know what to research in parallel until it
+// first does a discovery search and sees the results. Plan → Research is wrong
+// for questions like "find X then research their companies" because the company
+// list isn't known until the discovery search completes.
 
 async function streamScenario(res, message, sessionId, model) {
   const hist = getHistory(sessionId);
   const histContext = hist.length
     ? 'Prior conversation:\n' + hist.map(h => `${h.role}: ${h.content}`).join('\n') + '\n\n'
     : '';
+  const baseSystem = histContext
+    ? `${histContext}Be precise and concise. Use prior context for follow-up answers.`
+    : 'Be precise and concise.';
 
-  // ══ Iteration 0: Plan ═════════════════════════════════════════════════════
+  // ══ Iteration 0: Discovery search ════════════════════════════════════════
   agentEvent(res, { type: 'iteration_start', iteration: 0 });
   await sleep(jitter(100));
   agentEvent(res, { type: 'think_start', iteration: 0 });
   await sleep(jitter(350, 0.2));
-  const planReasoning = `I need to plan how to research: "${message.slice(0, 80)}"`;
-  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: planReasoning });
+  const discoverReasoning = `I'll start with a discovery search to understand the full scope before deciding what to research next`;
+  agentEvent(res, { type: 'think_done', iteration: 0, partial_text: discoverReasoning });
   await sleep(80);
 
   agentEvent(res, { type: 'act_start', iteration: 0, num_tools: 1 });
-  const planCallId = randHex(4);
-  agentEvent(res, { type: 'tool_call_start', call_id: planCallId,
-    name: 'plan_research', args: { question: message.slice(0, 140) } });
+  const discoverCallId = randHex(4);
+  agentEvent(res, { type: 'tool_call_start', call_id: discoverCallId,
+    name: 'perplexity_search', args: { query: message } });
 
-  // Ask the LLM to decide the decomposition
-  let subQueries = null;
-  if (PERPLEXITY_KEY) {
-    try {
-      const planSystem =
-        `You are a research planner. Given a question, output a JSON array of 2-4 focused ` +
-        `search queries that together will comprehensively answer it. Each query must cover a ` +
-        `distinct aspect with no overlap. ` +
-        (histContext ? `Prior conversation for context:\n${histContext}\n` : '') +
-        `Output ONLY a valid JSON array of strings — no explanation, no markdown fences.`;
-      const planRes = await callPerplexity(message, planSystem);
-      if (planRes?.content) {
-        const match = planRes.content.match(/\[[\s\S]*?\]/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (Array.isArray(parsed) && parsed.length >= 2) {
-            subQueries = parsed.slice(0, 4).map(String);
-          }
-        }
-      }
-    } catch (e) {
-      console.error('[plan]', e.message);
+  const tDiscover = Date.now();
+  let discoveryResult = null;
+  try {
+    const pplx = await callPerplexity(message, baseSystem);
+    if (pplx) {
+      discoveryResult = pplx.citations?.length
+        ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
+        : pplx.content;
     }
-  }
-  if (!subQueries) subQueries = decomposeQuery(message);
+  } catch (e) { console.error('[discover]', e.message); }
+  const discoverDuration = Date.now() - tDiscover;
+  if (!discoveryResult) discoveryResult = `No results for: "${message}"`;
 
-  const planSummary = `Research plan (${subQueries.length} parallel searches):\n` +
-    subQueries.map((q, i) => `${i + 1}. ${q}`).join('\n');
-  agentEvent(res, { type: 'tool_call_done', call_id: planCallId,
-    name: 'plan_research', result: planSummary, success: true });
+  agentEvent(res, { type: 'tool_call_done', call_id: discoverCallId,
+    name: 'perplexity_search', result: discoveryResult, success: true });
   await sleep(60);
   agentEvent(res, { type: 'observe_done', iteration: 0 });
   await sleep(100);
 
-  // ══ Iteration 1: Parallel research ════════════════════════════════════════
+  // ══ Iteration 1: Plan follow-up based on what was discovered ═════════════
   agentEvent(res, { type: 'iteration_start', iteration: 1 });
   await sleep(jitter(80));
   agentEvent(res, { type: 'think_start', iteration: 1 });
   await sleep(jitter(300, 0.2));
-  const researchReasoning = `Executing ${subQueries.length} parallel searches`;
-  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: researchReasoning });
+  const planReasoning = `I can now see what was discovered — deciding which entities need deeper parallel research`;
+  agentEvent(res, { type: 'think_done', iteration: 1, partial_text: planReasoning });
   await sleep(80);
 
-  agentEvent(res, { type: 'act_start', iteration: 1, num_tools: subQueries.length });
-  await sleep(40);
+  agentEvent(res, { type: 'act_start', iteration: 1, num_tools: 1 });
+  const planCallId = randHex(4);
+  agentEvent(res, { type: 'tool_call_start', call_id: planCallId,
+    name: 'plan_followup', args: { based_on: 'discovery results' } });
 
-  const callIds = subQueries.map(() => randHex(4));
-  for (let i = 0; i < subQueries.length; i++) {
-    agentEvent(res, { type: 'tool_call_start', call_id: callIds[i],
-      name: 'perplexity_search', args: { query: subQueries[i] } });
-    if (i < subQueries.length - 1) await sleep(15);
+  let followUpQueries = [];
+  if (PERPLEXITY_KEY) {
+    try {
+      const planPrompt =
+        `Original question: "${message}"\n\n` +
+        `Discovery results:\n${discoveryResult.slice(0, 2000)}\n\n` +
+        `Based on these results, identify specific entities (companies, people, topics, products) ` +
+        `from the discovery that should each be researched individually in more depth. ` +
+        `Output ONLY a JSON array of focused search query strings (2-5 queries). ` +
+        `If the discovery already fully answers the question output []. ` +
+        `No explanation, no markdown fences — just the array.`;
+      const planRes = await callPerplexity(planPrompt, 'You are a research planner. Output only a JSON array of strings.');
+      if (planRes?.content) {
+        const match = planRes.content.match(/\[[\s\S]*?\]/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed)) followUpQueries = parsed.slice(0, 5).map(String).filter(Boolean);
+        }
+      }
+    } catch (e) { console.error('[plan-followup]', e.message); }
   }
+  if (!followUpQueries.length) followUpQueries = decomposeQuery(message);
 
-  const t0 = Date.now();
-  const rawResults = await Promise.all(
-    subQueries.map(q => callPerplexity(q, 'Be precise and concise.').catch(e => {
-      console.error('[perplexity]', e.message); return null;
-    }))
-  );
-  const parallelDuration = Date.now() - t0;
-
-  const toolResults = [];
-  for (let i = 0; i < subQueries.length; i++) {
-    const pplx = rawResults[i];
-    const result = pplx
-      ? (pplx.citations?.length
-          ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
-          : pplx.content)
-      : `No result for: "${subQueries[i]}"`;
-    agentEvent(res, { type: 'tool_call_done', call_id: callIds[i],
-      name: 'perplexity_search', result, success: !!pplx });
-    toolResults.push(result);
-    await sleep(25);
-  }
-
+  const planResult = `Follow-up plan (${followUpQueries.length} parallel searches):\n` +
+    followUpQueries.map((q, i) => `${i + 1}. ${q}`).join('\n');
+  agentEvent(res, { type: 'tool_call_done', call_id: planCallId,
+    name: 'plan_followup', result: planResult, success: true });
   await sleep(60);
   agentEvent(res, { type: 'observe_done', iteration: 1 });
   await sleep(100);
 
-  // ══ Iteration 2: Synthesize ════════════════════════════════════════════════
+  // ══ Iteration 2: Parallel deep-dive on discovered entities ════════════════
   agentEvent(res, { type: 'iteration_start', iteration: 2 });
   await sleep(jitter(80));
   agentEvent(res, { type: 'think_start', iteration: 2 });
-  await sleep(jitter(350, 0.2));
-  agentEvent(res, { type: 'think_done', iteration: 2,
-    partial_text: 'Synthesising results from parallel searches into one answer…' });
+  await sleep(jitter(300, 0.2));
+  const deepReasoning = `Executing ${followUpQueries.length} parallel deep-dive searches on discovered entities`;
+  agentEvent(res, { type: 'think_done', iteration: 2, partial_text: deepReasoning });
   await sleep(80);
 
-  agentEvent(res, { type: 'act_start', iteration: 2, num_tools: 1 });
+  agentEvent(res, { type: 'act_start', iteration: 2, num_tools: followUpQueries.length });
+  await sleep(40);
+
+  const deepCallIds = followUpQueries.map(() => randHex(4));
+  for (let i = 0; i < followUpQueries.length; i++) {
+    agentEvent(res, { type: 'tool_call_start', call_id: deepCallIds[i],
+      name: 'perplexity_search', args: { query: followUpQueries[i] } });
+    if (i < followUpQueries.length - 1) await sleep(15);
+  }
+
+  const tDeep = Date.now();
+  const rawDeep = await Promise.all(
+    followUpQueries.map(q => callPerplexity(q, 'Be precise and concise.').catch(e => {
+      console.error('[deep]', e.message); return null;
+    }))
+  );
+  const deepDuration = Date.now() - tDeep;
+
+  const deepResults = [];
+  for (let i = 0; i < followUpQueries.length; i++) {
+    const pplx = rawDeep[i];
+    const result = pplx
+      ? (pplx.citations?.length
+          ? `${pplx.content}\n\nSources:\n${pplx.citations.map((u, j) => `[${j+1}] ${u}`).join('\n')}`
+          : pplx.content)
+      : `No result for: "${followUpQueries[i]}"`;
+    agentEvent(res, { type: 'tool_call_done', call_id: deepCallIds[i],
+      name: 'perplexity_search', result, success: !!pplx });
+    deepResults.push(result);
+    await sleep(25);
+  }
+
+  await sleep(60);
+  agentEvent(res, { type: 'observe_done', iteration: 2 });
+  await sleep(100);
+
+  // ══ Iteration 3: Synthesize all results ═══════════════════════════════════
+  agentEvent(res, { type: 'iteration_start', iteration: 3 });
+  await sleep(jitter(80));
+  agentEvent(res, { type: 'think_start', iteration: 3 });
+  await sleep(jitter(350, 0.2));
+  agentEvent(res, { type: 'think_done', iteration: 3,
+    partial_text: 'Synthesising discovery + all deep-dive results into one answer…' });
+  await sleep(80);
+
+  agentEvent(res, { type: 'act_start', iteration: 3, num_tools: 1 });
   const synthCallId = randHex(4);
   agentEvent(res, { type: 'tool_call_start', call_id: synthCallId,
-    name: 'synthesize', args: { sources: subQueries.length } });
+    name: 'synthesize', args: { sources: 1 + deepResults.length } });
 
   let finalAnswer = null;
   if (PERPLEXITY_KEY) {
     try {
       const synthUser =
-        `Question: "${message}"\n\n` +
-        subQueries.map((q, i) => `### Research ${i + 1}: ${q}\n${toolResults[i]}`).join('\n\n') +
-        `\n\nWrite a single, well-structured answer that synthesises all research above. ` +
-        `Be comprehensive yet concise. Use markdown. Do not repeat section headings from the research verbatim.`;
-      const synthSystem =
-        (histContext ? histContext : '') +
+        `Question: "${message}"\n\n## Discovery\n${discoveryResult}\n\n` +
+        followUpQueries.map((q, i) => `## Deep-dive: ${q}\n${deepResults[i]}`).join('\n\n') +
+        `\n\nWrite a single, well-structured answer synthesising all the above. ` +
+        `Be comprehensive yet concise. Use markdown. Integrate information naturally — ` +
+        `do not reference "Discovery" or "Deep-dive" sections explicitly.`;
+      const synthSystem = (histContext || '') +
         `You are a helpful research assistant. Synthesise multiple research results into one clear, ` +
-        `coherent answer. Do not say "according to research 1/2/3" — just integrate the information naturally.`;
+        `coherent answer. Do not say "according to source 1/2/3".`;
       const synthRes = await callPerplexity(synthUser, synthSystem);
       finalAnswer = synthRes?.content ?? null;
-    } catch (e) {
-      console.error('[synthesize]', e.message);
-    }
+    } catch (e) { console.error('[synthesize]', e.message); }
   }
-  // Fallback: labelled sections
   if (!finalAnswer) {
-    finalAnswer = toolResults
-      .map((r, i) => `### ${subQueries[i]}\n\n${r}`)
-      .join('\n\n---\n\n');
+    finalAnswer = `## Overview\n\n${discoveryResult}\n\n---\n\n` +
+      followUpQueries.map((q, i) => `### ${q}\n\n${deepResults[i]}`).join('\n\n---\n\n');
   }
 
   agentEvent(res, { type: 'tool_call_done', call_id: synthCallId,
     name: 'synthesize', result: finalAnswer.slice(0, 200) + '…', success: true });
   await sleep(60);
-  agentEvent(res, { type: 'observe_done', iteration: 2 });
+  agentEvent(res, { type: 'observe_done', iteration: 3 });
   await sleep(80);
 
-  agentEvent(res, { type: 'final_answer', content: finalAnswer, iterations: 3 });
+  agentEvent(res, { type: 'final_answer', content: finalAnswer, iterations: 4 });
 
   appendHistory(sessionId, 'user', message);
   appendHistory(sessionId, 'assistant', finalAnswer.slice(0, 800));
 
-  // OTel: iteration 1 tools are parallel, plan + synth are sequential single calls
-  const toolSpans = subQueries.map((_, i) => ({
+  // OTel spans: discover + plan are sequential; deep-dives are parallel; synth is sequential
+  const deepSpans = followUpQueries.map((_, i) => ({
     name: 'perplexity_search',
-    callId: callIds[i],
-    durationMs: Math.round(parallelDuration * (0.8 + Math.random() * 0.4)),
+    callId: deepCallIds[i],
+    durationMs: Math.round(deepDuration * (0.8 + Math.random() * 0.4)),
     parallel: true,
     startOffset: i * 15,
   }));
 
-  emitTrace(sessionId, model, 3, [
-    [{ name: 'plan_research',      callId: planCallId,  durationMs: jitter(350) }],
-    toolSpans,
-    [{ name: 'synthesize',         callId: synthCallId, durationMs: jitter(400) }],
+  emitTrace(sessionId, model, 4, [
+    [{ name: 'perplexity_search', callId: discoverCallId, durationMs: discoverDuration || jitter(600) }],
+    [{ name: 'plan_followup',     callId: planCallId,     durationMs: jitter(300) }],
+    deepSpans,
+    [{ name: 'synthesize',        callId: synthCallId,    durationMs: jitter(400) }],
   ], message, [
+    discoverReasoning,
     planReasoning,
-    researchReasoning,
-    'Synthesising results from parallel searches into one answer…',
+    deepReasoning,
+    'Synthesising discovery + all deep-dive results into one answer…',
   ]);
   res.end();
 }
