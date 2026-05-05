@@ -399,6 +399,13 @@ function makeSpan(name, tid, sid, parentSid, startMs, durationMs, attrs = {}) {
   };
 }
 
+function toolAttrs(tc) {
+  const a = { 'tool.name': tc.name, 'tool.call_id': tc.callId, 'tool.success': true };
+  if (tc.input)  a['tool.input']  = String(tc.input).slice(0, 600);
+  if (tc.output) a['tool.output'] = String(tc.output).slice(0, 600);
+  return a;
+}
+
 /**
  * Emit a realistic OTel trace for one request after the agent loop finishes.
  *
@@ -484,22 +491,14 @@ async function emitTrace(sessionId, model, iterations, toolCalls, message = '', 
         for (const tc of iterTools) {
           const toolSid = spanId();
           spans.push(makeSpan('tool.call', tid, toolSid, actSid,
-            actStart + 5 + (tc.startOffset || 0), tc.durationMs, {
-              'tool.name':    tc.name,
-              'tool.call_id': tc.callId,
-              'tool.success': true,
-            }));
+            actStart + 5 + (tc.startOffset || 0), tc.durationMs, toolAttrs(tc)));
         }
       } else {
         let toolOff = 5;
         for (const tc of iterTools) {
           const toolSid = spanId();
           spans.push(makeSpan('tool.call', tid, toolSid, actSid,
-            actStart + toolOff, tc.durationMs, {
-              'tool.name':    tc.name,
-              'tool.call_id': tc.callId,
-              'tool.success': true,
-            }));
+            actStart + toolOff, tc.durationMs, toolAttrs(tc)));
           toolOff += tc.durationMs + 5;
         }
       }
@@ -710,19 +709,21 @@ async function streamScenario(res, message, sessionId, model) {
   appendHistory(sessionId, 'assistant', finalAnswer.slice(0, 800));
 
   // OTel spans: discover + plan are sequential; deep-dives are parallel; synth is sequential
-  const deepSpans = followUpQueries.map((_, i) => ({
+  const deepSpans = followUpQueries.map((q, i) => ({
     name: 'perplexity_search',
     callId: deepCallIds[i],
     durationMs: Math.round(deepDuration * (0.8 + Math.random() * 0.4)),
     parallel: true,
     startOffset: i * 15,
+    input: q,
+    output: deepResults[i],
   }));
 
   emitTrace(sessionId, model, 4, [
-    [{ name: 'perplexity_search', callId: discoverCallId, durationMs: discoverDuration || jitter(600) }],
-    [{ name: 'plan_followup',     callId: planCallId,     durationMs: jitter(300) }],
+    [{ name: 'perplexity_search', callId: discoverCallId, durationMs: discoverDuration || jitter(600), input: message,                          output: discoveryResult }],
+    [{ name: 'plan_followup',     callId: planCallId,     durationMs: jitter(300),                    input: message,                          output: planResult }],
     deepSpans,
-    [{ name: 'synthesize',        callId: synthCallId,    durationMs: jitter(400) }],
+    [{ name: 'synthesize',        callId: synthCallId,    durationMs: jitter(400),                    input: `${1 + deepResults.length} sources`, output: finalAnswer }],
   ], message, [
     discoverReasoning,
     planReasoning,
@@ -802,7 +803,7 @@ async function streamPsychologist(res, message, sessionId, model, sentiment) {
   appendHistory(sessionId, 'assistant', response.slice(0, 800));
 
   emitTrace(sessionId, model, 2,
-    [[{ name: 'emotional_support', callId, durationMs: toolDuration || jitter(400) }], []],
+    [[{ name: 'emotional_support', callId, durationMs: toolDuration || jitter(400), input: message, output: response }], []],
     message, [reasoning, 'Formulating empathetic response…']);
   res.end();
 }
